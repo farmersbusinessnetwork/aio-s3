@@ -323,6 +323,7 @@ class Bucket(object):
         if port != 80:
             self._host = self._host + ':' + str(port)
         self._signature = signature
+        self._session = aiohttp.ClientSession(connector=connector)
 
     @asyncio.coroutine
     def exists(self, prefix=''):
@@ -491,11 +492,10 @@ class Bucket(object):
         _SIGNATURES[self._signature](req, **self._aws_sign_data)
         if isinstance(req.payload, bytes):
             req.headers['CONTENT-LENGTH'] = str(len(req.payload))
-        return (yield from aiohttp.request(req.verb, req.url,
+        return (yield from self._session.request(req.verb, req.url,
             chunked='CONTENT-LENGTH' not in req.headers,
             headers=req.headers,
-            data=req.payload,
-            connector=self._connector))
+            data=req.payload))
 
     @asyncio.coroutine
     def upload_multipart(self, key,
