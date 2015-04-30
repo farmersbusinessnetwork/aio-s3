@@ -67,8 +67,14 @@ class Request(object):
 
     @property
     def url(self):
-        return 'http://{0.headers[HOST]}{0.resource}?{0.query_string}' \
-            .format(self)
+        hostHeader = self.headers['HOST']
+        hostPort = hostHeader.split(':')
+        proto = 'http'
+        if (len(hostPort) == 2):
+            if (hostPort[1] == '443'):
+                proto = 'https'
+        return '{1}://{0.headers[HOST]}{0.resource}?{0.query_string}' \
+            .format(self, proto)
 
 
 def _hmac(key, val):
