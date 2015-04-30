@@ -250,7 +250,7 @@ class MultipartUpload(object):
                 responseXML = parse_xml(xmlBytes)
                 etag = responseXML.find('s3:ETag', namespaces=NS).text.strip('"')
         finally:
-            result.close()
+            yield from result.wait_for_close()
         self.parts[partNumber] = etag
         
     @asyncio.coroutine
@@ -282,7 +282,7 @@ class MultipartUpload(object):
             xml = parse_xml(xml)
             return xml.find('s3:ETag', namespaces=NS)
         finally:
-            result.close()
+            yield from result.wait_for_close()
 
     @asyncio.coroutine
     def close(self):
@@ -298,7 +298,7 @@ class MultipartUpload(object):
             if result.status != 204:
                 raise errors.AWSException.from_bytes(result.status, xml)
         finally:
-            result.close()
+            yield from result.wait_for_close()
 
 
 class Bucket(object):
@@ -407,16 +407,6 @@ class Bucket(object):
         return result
 
     @asyncio.coroutine
-    def __headInSemaphore(self, key, semaphore):
-        yield from semaphore.acquire()
-        try:
-            response = yield from self.head(key)
-            reponse.close()
-            return response
-        finally:
-            semaphore.release()
-
-    @asyncio.coroutine
     def download(self, key):
         if isinstance(key, Key):
             key = key.key
@@ -459,7 +449,7 @@ class Bucket(object):
                 raise errors.AWSException.from_bytes(result.status, xml)
             return result
         finally:
-            result.close()
+            yield from result.wait_for_close()
 
     @asyncio.coroutine
     def delete(self, key):
@@ -473,7 +463,7 @@ class Bucket(object):
                 raise errors.AWSException.from_bytes(result.status, xml)
             return result
         finally:
-            result.close()
+            yield from result.wait_for_close()
 
     @asyncio.coroutine
     def get(self, key):
@@ -520,4 +510,4 @@ class Bucket(object):
             assert upload_id, xml
             return MultipartUpload(self, key, upload_id)
         finally:
-            result.close()
+            yield from result.wait_for_close()
