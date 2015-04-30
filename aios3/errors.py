@@ -9,7 +9,10 @@ class AWSException(Exception):
         if not body:
             # sometimes Riak CS doesn't have response body :(
             # TODO(tailhook) maybe use status to create specific error?
-            raise RuntimeError("HTTP Error {}".format(status))
+            if (status != 404):
+                raise RuntimeError("HTTP Error {}".format(status))
+            else:
+                raise NotFound()
         try:
             xml = parse_xml(body)
         except ParseError:
@@ -25,6 +28,8 @@ class AWSException(Exception):
         msg = xml.find("Message")
         return cls(class_name if msg is None else msg.text)
 
+
+class NotFound(Exception): pass
 
 class AccessDenied(AWSException): pass
 class AccountProblem(AWSException): pass
