@@ -242,7 +242,7 @@ class MultipartUpload(object):
         try:
             if result.status != 200:
                 xml = yield from result.read()
-                raise errors.AWSException.from_bytes(result.status, xml)
+                raise errors.AWSException.from_bytes(result.status, xml, self.key + ":" +str(partNumber))
             if not isCopy:
                 etag = result.headers['ETAG']
             else:
@@ -278,7 +278,7 @@ class MultipartUpload(object):
         try:
             xml = yield from result.read()
             if result.status != 200:
-                raise errors.AWSException.from_bytes(result.status, xml)
+                raise errors.AWSException.from_bytes(result.status, xml, self.key)
             xml = parse_xml(xml)
             return xml.find('s3:ETag', namespaces=NS)
         finally:
@@ -296,7 +296,7 @@ class MultipartUpload(object):
         try:
             xml = yield from result.read()
             if result.status != 204:
-                raise errors.AWSException.from_bytes(result.status, xml)
+                raise errors.AWSException.from_bytes(result.status, xml, self.key)
         finally:
             yield from result.wait_for_close()
 
@@ -338,7 +338,7 @@ class Bucket(object):
             ))
         data = (yield from result.read())
         if result.status != 200:
-            raise errors.AWSException.from_bytes(result.status, data)
+            raise errors.AWSException.from_bytes(result.status, data, self._name)
         x = parse_xml(data)
         return any(map(Key.from_xml,
                         x.findall('s3:Contents', namespaces=NS)))
@@ -355,7 +355,7 @@ class Bucket(object):
             ))
         data = (yield from result.read())
         if result.status != 200:
-            raise errors.AWSException.from_bytes(result.status, data)
+            raise errors.AWSException.from_bytes(result.status, data, self._name)
         x = parse_xml(data)
         if x.find('s3:IsTruncated', namespaces=NS).text != 'false':
             raise AssertionError(
@@ -381,7 +381,7 @@ class Bucket(object):
                 ))
             data = (yield from result.read())
             if result.status != 200:
-                raise errors.AWSException.from_bytes(result.status, data)
+                raise errors.AWSException.from_bytes(result.status, data, self._name)
             x = parse_xml(data)
             result = list(map(Key.from_xml,
                             x.findall('s3:Contents', namespaces=NS)))
@@ -403,7 +403,7 @@ class Bucket(object):
             "HEAD", '/' + key, {}, {'HOST': self._host}, b''))
         if result.status != 200:
             raise errors.AWSException.from_bytes(
-                result.status, (yield from result.read()))
+                result.status, (yield from result.read()), key)
         return result
 
     @asyncio.coroutine
@@ -414,7 +414,7 @@ class Bucket(object):
             "GET", '/' + key, {}, {'HOST': self._host}, b''))
         if result.status != 200:
             raise errors.AWSException.from_bytes(
-                result.status, (yield from result.read()))
+                result.status, (yield from result.read()), key)
         return result
 
     @asyncio.coroutine
@@ -446,7 +446,7 @@ class Bucket(object):
         try:
             if result.status != 200:
                 xml = yield from result.read()
-                raise errors.AWSException.from_bytes(result.status, xml)
+                raise errors.AWSException.from_bytes(result.status, xml, key)
             return result
         finally:
             yield from result.wait_for_close()
@@ -473,7 +473,7 @@ class Bucket(object):
             "GET", '/' + key, {}, {'HOST': self._host}, b''))
         if result.status != 200:
             raise errors.AWSException.from_bytes(
-                result.status, (yield from result.read()))
+                result.status, (yield from result.read()), key)
         data = yield from result.read()
         return data
 
@@ -503,7 +503,7 @@ class Bucket(object):
         try:
             if result.status != 200:
                 xml = yield from result.read()
-                raise errors.AWSException.from_bytes(result.status, xml)
+                raise errors.AWSException.from_bytes(result.status, xml, key)
             xml = yield from result.read()
             upload_id = parse_xml(xml).find('s3:UploadId',
                                             namespaces=NS).text
