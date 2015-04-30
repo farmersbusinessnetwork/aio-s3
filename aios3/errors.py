@@ -29,6 +29,7 @@ class AWSException(Exception):
 class AccessDenied(AWSException): pass
 class AccountProblem(AWSException): pass
 class AmbiguousGrantByEmailAddress(AWSException): pass
+class AuthorizationHeaderMalformed(AWSException): pass
 class BadDigest(AWSException): pass
 class BucketAlreadyExists(AWSException): pass
 class BucketAlreadyOwnedByYou(AWSException): pass

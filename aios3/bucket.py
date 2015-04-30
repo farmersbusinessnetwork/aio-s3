@@ -176,55 +176,91 @@ def sign_v2(req, aws_key, aws_secret, aws_bucket, **_):
     req.headers['Authorization'] = ahdr
 
 
+class ObjectChunk(object):
+    def __init__(self, bucket, key, firstByte, lastByte):
+        if (isinstance(bucket, Bucket)):
+            bucket = bucket._name
+        self.bucket = bucket
+        self.key = key
+        self.firstByte = firstByte
+        self.lastByte = lastByte
+
+
+
 class MultipartUpload(object):
 
     def __init__(self, bucket, key, upload_id):
         self.bucket = bucket
         self.key = key
         self.upload_id = upload_id
-        self.xml = Element('CompleteMultipartUpload')
-        self.parts = 0
+        self.parts = {}
         self._done = False
         self._uri = '/' + self.key + '?uploadId=' + self.upload_id
 
     @asyncio.coroutine
     def add_chunk(self, data):
-        assert isinstance(data, (bytes, memoryview, bytearray)), data
+        assert isinstance(data, (bytes, memoryview, bytearray, ObjectChunk)), data
 
         # figure out how to check chunk size, all but last one
         # assert len(data) > 5 << 30, "Chunk must be at least 5Mb"
 
         if self._done:
             raise RuntimeError("Can't add_chunk after commit or close")
-        self.parts += 1
+        
+        partNumber = len(self.parts) + 1
+        self.parts[partNumber] = None
+
+        headers = {
+            'HOST': self.bucket._host,
+            # next one aiohttp adds for us anyway, so we must put it here
+            # so it's added into signature
+            'CONTENT-TYPE': 'application/octed-stream',
+        }
+
+        isCopy = False
+        if (isinstance(data, ObjectChunk)):
+            objChunk = data
+            data = b''
+            headers['x-amz-copy-source'] = "{0}/{1}".format(objChunk.bucket, objChunk.key)
+            headers['x-amz-copy-source-range'] = "bytes={0}-{1}".format(objChunk.firstByte, objChunk.lastByte)
+            isCopy = True
+        else:
+            headers['CONTENT-LENGTH'] = str(len(data))
+            
+
         result = yield from self.bucket._request(Request("PUT",
             '/' + self.key, {
                 'uploadId': self.upload_id,
-                'partNumber': str(self.parts),
-            }, headers={
-                'CONTENT-LENGTH': str(len(data)),
-                'HOST': self.bucket._host,
-                # next one aiohttp adds for us anyway, so we must put it here
-                # so it's added into signature
-                'CONTENT-TYPE': 'application/octed-stream',
-            }, payload=data))
+                'partNumber': str(partNumber),
+            }, headers=headers, payload=data))
         try:
             if result.status != 200:
                 xml = yield from result.read()
                 raise errors.AWSException.from_bytes(result.status, xml)
-            etag = result.headers['ETAG']
+            if not isCopy:
+                etag = result.headers['ETAG']
+            else:
+                xmlBytes = yield from result.content.read()
+                responseXML = parse_xml(xmlBytes)
+                etag = responseXML.find('s3:ETag', namespaces=NS).text.strip('"')
         finally:
             result.close()
-        chunk = SubElement(self.xml, 'Part')
-        SubElement(chunk, 'PartNumber').text = str(self.parts)
-        SubElement(chunk, 'ETag').text = etag
-
+        self.parts[partNumber] = etag
+        
     @asyncio.coroutine
     def commit(self):
         if self._done:
             raise RuntimeError("Can't commit twice or after close")
         self._done = True
-        data = xml_tostring(self.xml)
+        xml = Element('CompleteMultipartUpload')
+        for (partNumber, etag) in sorted(self.parts.items(), key=lambda i: i[0]):
+            if (etag is None):
+                raise RuntimeError("Missing ETAG for part {0}".format(partNumber))
+            chunk = SubElement(xml, 'Part')
+            SubElement(chunk, 'PartNumber').text = str(partNumber)
+            SubElement(chunk, 'ETag').text = etag
+
+        data = xml_tostring(xml)
         result = yield from self.bucket._request(Request("POST",
             '/' + self.key, {
                 'uploadId': self.upload_id,
@@ -351,6 +387,27 @@ class Bucket(object):
 
         while not final:
             yield read_next()
+
+    @asyncio.coroutine
+    def head(self, key):
+        if isinstance(key, Key):
+            key = key.key
+        result = yield from self._request(Request(
+            "HEAD", '/' + key, {}, {'HOST': self._host}, b''))
+        if result.status != 200:
+            raise errors.AWSException.from_bytes(
+                result.status, (yield from result.read()))
+        return result
+
+    @asyncio.coroutine
+    def __headInSemaphore(self, key, semaphore):
+        yield from semaphore.acquire()
+        try:
+            response = yield from self.head(key)
+            reponse.close()
+            return response
+        finally:
+            semaphore.release()
 
     @asyncio.coroutine
     def download(self, key):
