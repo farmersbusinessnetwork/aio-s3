@@ -58,8 +58,8 @@ class Request(object):
         self.verb = verb
         self.resource = amz_uriencode_slash(resource)
         self.params = query
-        self.query_string = '&'.join(k + '=' + v
-            for k, v in sorted((amz_uriencode(k), amz_uriencode(v))
+        self.query_string = '&'.join(k + '=' + v if v else k
+            for k, v in sorted((amz_uriencode(k), amz_uriencode(v) if v is not None else None)
                                for k, v in query.items()))
         self.headers = headers
         self.payload = payload
@@ -300,6 +300,24 @@ class MultipartUpload(object):
         finally:
             yield from result.wait_for_close()
 
+@asyncio.coroutine
+def getLocation(name, *, port=80, aws_key, aws_secret, connector=None):
+    b = Bucket(name=name, port=port, aws_key=aws_key, aws_secret=aws_secret, connector=connector, signature=SIGNATURE_V2)
+    request = Request("GET", "/", {'location' : None}, {'HOST': b._host}, b'')
+    request.params = {'location' : None}
+    request.query_string = "location"
+    result = yield from b._request(request)
+    try:
+        data = yield from result.read()
+        if result.status != 200:
+            raise errors.AWSException.from_bytes(result.status, data, b._name)
+        x = parse_xml(data)
+        region = x.text
+        if (region is None) or (len(region) == 0):
+            return 'us-east-1'
+        return region
+    finally:
+        yield from result.wait_for_close()
 
 class Bucket(object):
 
