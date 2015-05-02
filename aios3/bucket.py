@@ -58,7 +58,7 @@ class Request(object):
         self.verb = verb
         self.resource = amz_uriencode_slash(resource)
         self.params = query
-        self.query_string = '&'.join(k + '=' + v if v else k
+        self.query_string = '&'.join(k + '=' + v if v is not None else k
             for k, v in sorted((amz_uriencode(k), amz_uriencode(v) if v is not None else None)
                                for k, v in query.items()))
         self.headers = headers
