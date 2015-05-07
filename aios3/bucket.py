@@ -244,13 +244,15 @@ class MultipartUpload(object):
                 xml = yield from result.read()
                 raise errors.AWSException.from_bytes(result.status, xml, self.key + ":" +str(partNumber))
             if not isCopy:
-                etag = result.headers['ETAG']
+                etag = result.headers['ETAG']   # per AWS docs get the etag from the headers
             else:
+                # Per AWS docs if copy case need to get the etag from the XML response
                 xmlBytes = yield from result.content.read()
                 responseXML = parse_xml(xmlBytes)
                 etag = responseXML.find('s3:ETag', namespaces=NS).text.strip('"')
         finally:
             yield from result.wait_for_close()
+            
         self.parts[partNumber] = etag
         
     @asyncio.coroutine
@@ -304,7 +306,9 @@ class MultipartUpload(object):
 def getLocation(name, *, port=80, aws_key, aws_secret, connector=None):
     b = Bucket(name=name, port=port, aws_key=aws_key, aws_secret=aws_secret, connector=connector, signature=SIGNATURE_V2)
     request = Request("GET", "/", {'location' : None}, {'HOST': b._host}, b'')
+    # whack the params field because the constructor set it wrong.
     request.params = {'location' : None}
+    # whack the query_string field because the constructor set it wrong.
     request.query_string = "location"
     result = yield from b._request(request)
     try:
@@ -425,11 +429,12 @@ class Bucket(object):
         return result
 
     @asyncio.coroutine
-    def download(self, key):
+    def download(self, key, versionId=None):
         if isinstance(key, Key):
             key = key.key
+        params = {} if versionId is None else {'versionId' : versionId}
         result = yield from self._request(Request(
-            "GET", '/' + key, {}, {'HOST': self._host}, b''))
+            "GET", '/' + key, params, {'HOST': self._host}, b''))
         if result.status != 200:
             raise errors.AWSException.from_bytes(
                 result.status, (yield from result.read()), key)
