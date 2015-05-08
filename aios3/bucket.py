@@ -228,7 +228,7 @@ class MultipartUpload(object):
         if (isinstance(data, ObjectChunk)):
             objChunk = data
             data = b''
-            srcPath = "/{0}/{1}".format(objChunk.bucket, objChunk.key)
+            srcPath = "/{0}/{1}".format(objChunk.bucket, amz_uriencode(objChunk.key))
             if (objChunk.versionId is not None):
                 srcPath = srcPath + "?versionId={0}".format(objChunk.versionId)
             headers['x-amz-copy-source'] = srcPath
