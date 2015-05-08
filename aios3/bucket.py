@@ -183,13 +183,14 @@ def sign_v2(req, aws_key, aws_secret, aws_bucket, **_):
 
 
 class ObjectChunk(object):
-    def __init__(self, bucket, key, firstByte, lastByte):
+    def __init__(self, bucket, key, firstByte, lastByte, versionId=None):
         if (isinstance(bucket, Bucket)):
             bucket = bucket._name
         self.bucket = bucket
         self.key = key
         self.firstByte = firstByte
         self.lastByte = lastByte
+        self.versionId = versionId
 
 
 
@@ -227,7 +228,10 @@ class MultipartUpload(object):
         if (isinstance(data, ObjectChunk)):
             objChunk = data
             data = b''
-            headers['x-amz-copy-source'] = "{0}/{1}".format(objChunk.bucket, objChunk.key)
+            srcPath = "/{0}/{1}".format(objChunk.bucket, objChunk.key)
+            if (objChunk.versionId is not None):
+                srcPath = srcPath + "?versionId={0}".format(objChunk.versionId)
+            headers['x-amz-copy-source'] = srcPath
             headers['x-amz-copy-source-range'] = "bytes={0}-{1}".format(objChunk.firstByte, objChunk.lastByte)
             isCopy = True
         else:
@@ -418,11 +422,12 @@ class Bucket(object):
             yield read_next()
 
     @asyncio.coroutine
-    def head(self, key):
+    def head(self, key, versionId=None):
         if isinstance(key, Key):
             key = key.key
+        params = {} if versionId is None else {'versionId' : versionId}
         result = yield from self._request(Request(
-            "HEAD", '/' + key, {}, {'HOST': self._host}, b''))
+            "HEAD", '/' + key, params, {'HOST': self._host}, b''))
         if result.status != 200:
             raise errors.AWSException.from_bytes(
                 result.status, (yield from result.read()), key)
