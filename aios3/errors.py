@@ -5,11 +5,14 @@ class AWSException(Exception):
     """Base for exceptions returned by amazon"""
 
     @staticmethod
-    def from_bytes(status, body):
+    def from_bytes(status, body, url=None):
         if not body:
             # sometimes Riak CS doesn't have response body :(
             # TODO(tailhook) maybe use status to create specific error?
-            raise RuntimeError("HTTP Error {}".format(status))
+            if (status != 404):
+                raise RuntimeError("HTTP Error {}".format(status))
+            else:
+                raise NotFound()
         try:
             xml = parse_xml(body)
         except ParseError:
@@ -23,12 +26,18 @@ class AWSException(Exception):
         except KeyError:
             raise RuntimeError("Error {} is unknown".format(class_name))
         msg = xml.find("Message")
-        return cls(class_name if msg is None else msg.text)
+        msg = class_name if msg is None else msg.text
+        if (url is not None):
+            msg = url + " " + msg
+        return cls(msg)
 
+
+class NotFound(Exception): pass
 
 class AccessDenied(AWSException): pass
 class AccountProblem(AWSException): pass
 class AmbiguousGrantByEmailAddress(AWSException): pass
+class AuthorizationHeaderMalformed(AWSException): pass
 class BadDigest(AWSException): pass
 class BucketAlreadyExists(AWSException): pass
 class BucketAlreadyOwnedByYou(AWSException): pass
