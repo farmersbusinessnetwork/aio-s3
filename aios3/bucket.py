@@ -3,9 +3,8 @@ import hmac
 import base64
 import hashlib
 import asyncio
-from xml.etree.ElementTree import fromstring as parse_xml
-from xml.etree.ElementTree import tostring as xml_tostring
-from xml.etree.ElementTree import Element, SubElement
+import xmltodict
+
 from functools import partial
 from urllib.parse import quote
 
@@ -16,8 +15,6 @@ from . import errors
 
 amz_uriencode = partial(quote, safe='~')
 amz_uriencode_slash = partial(quote, safe='~/')
-S3_NS = 'http://s3.amazonaws.com/doc/2006-03-01/'
-NS = {'s3': S3_NS}
 
 _SIGNATURES = {}
 SIGNATURE_V2 = 'v2'
@@ -35,39 +32,38 @@ class Key(object):
         self.key = key
         self.last_modified = last_modified
         self.etag = etag
-        self.size = size
+        self.size = int(size)
         self.storage_class = storage_class
 
     @classmethod
-    def from_xml(Key, el):
+    def from_dict(Key, d):
         return Key(
-            key=el.find('s3:Key', namespaces=NS).text,
-            last_modified=datetime.datetime.strptime(
-                el.find('s3:LastModified', namespaces=NS).text,
-                '%Y-%m-%dT%H:%M:%S.000Z'),
-            etag=el.find('s3:ETag', namespaces=NS).text,
-            size=int(el.find('s3:Size', namespaces=NS).text),
-            storage_class=el.find('s3:StorageClass', namespaces=NS).text)
+            key=d['Key'], last_modified=datetime.datetime.strptime(d['LastModified'], '%Y-%m-%dT%H:%M:%S.000Z'),
+            etag=d['ETag'], size=d['Size'], storage_class=d['StorageClass']
+        )
 
     def __repr__(self):
         return '<Key {}:{}>'.format(self.key, self.size)
 
 
 class Request(object):
-    def __init__(self, verb, resource, query, headers, payload):
+    def __init__(self, verb, resource, query, headers, payload, scheme='http'):
         self.verb = verb
         self.resource = amz_uriencode_slash(resource)
         self.params = query
+
         self.query_string = '&'.join(k + '=' + v
             for k, v in sorted((amz_uriencode(k), amz_uriencode(v))
                                for k, v in query.items()))
+
         self.headers = headers
         self.payload = payload
         self.content_md5 = ''
+        self.scheme = scheme
 
     @property
     def url(self):
-        return 'http://{0.headers[HOST]}{0.resource}?{0.query_string}' \
+        return '{0.scheme}://{0.headers[HOST]}{0.resource}?{0.query_string}' \
             .format(self)
 
 
@@ -182,10 +178,38 @@ class MultipartUpload(object):
         self.bucket = bucket
         self.key = key
         self.upload_id = upload_id
-        self.xml = Element('CompleteMultipartUpload')
-        self.parts = 0
+        self.parts = dict()  # num -> etag
         self._done = False
         self._uri = '/' + self.key + '?uploadId=' + self.upload_id
+
+    @asyncio.coroutine
+    def copy_chunk(self, copy_source, copy_source_range):
+        if self._done:
+            raise RuntimeError("Can't add_chunk after commit or close")
+        part_num = len(self.parts) + 1
+        self.parts[part_num] = None
+
+        result = yield from self.bucket._request(Request("PUT",
+            '/' + self.key, {
+                'uploadId': self.upload_id,
+                'partNumber': str(part_num),
+            }, headers={
+                    'x-amz-copy-source': copy_source,
+                    'x-amz-copy-source-range': copy_source_range,
+                    'HOST': self.bucket._host,
+            }, payload=b'',
+            scheme=self.bucket._scheme))
+        try:
+            xml = yield from result.read()
+            if result.status != 200:
+                raise errors.AWSException.from_bytes(result.status, xml)
+
+            xml = xmltodict.parse(xml)["CopyPartResult"]
+            etag = xml["ETag"]
+            if etag.startswith("\""): etag = etag[1:-1]
+            self.parts[part_num] = etag
+        finally:
+            result.close()
 
     @asyncio.coroutine
     def add_chunk(self, data):
@@ -196,35 +220,41 @@ class MultipartUpload(object):
 
         if self._done:
             raise RuntimeError("Can't add_chunk after commit or close")
-        self.parts += 1
+        part_num = len(self.parts) + 1
+        self.parts[part_num] = None
+
         result = yield from self.bucket._request(Request("PUT",
             '/' + self.key, {
                 'uploadId': self.upload_id,
-                'partNumber': str(self.parts),
+                'partNumber': str(part_num),
             }, headers={
                 'CONTENT-LENGTH': str(len(data)),
                 'HOST': self.bucket._host,
                 # next one aiohttp adds for us anyway, so we must put it here
                 # so it's added into signature
                 'CONTENT-TYPE': 'application/octed-stream',
-            }, payload=data))
+            }, payload=data,
+            scheme=self.bucket._scheme))
         try:
             if result.status != 200:
                 xml = yield from result.read()
                 raise errors.AWSException.from_bytes(result.status, xml)
             etag = result.headers['ETAG']
+            self.parts[part_num] = etag
         finally:
             result.close()
-        chunk = SubElement(self.xml, 'Part')
-        SubElement(chunk, 'PartNumber').text = str(self.parts)
-        SubElement(chunk, 'ETag').text = etag
 
     @asyncio.coroutine
     def commit(self):
         if self._done:
             raise RuntimeError("Can't commit twice or after close")
         self._done = True
-        data = xml_tostring(self.xml)
+
+        self.parts = [{'PartNumber': n, 'ETag': etag} for n, etag in self.parts.items()]
+        self.parts = sorted(self.parts, key=lambda x: x['PartNumber'])
+        self.xml = {"CompleteMultipartUpload": {'Part': self.parts}}
+        data = xmltodict.unparse(self.xml, full_document=False).encode('utf8')
+
         result = yield from self.bucket._request(Request("POST",
             '/' + self.key, {
                 'uploadId': self.upload_id,
@@ -232,13 +262,14 @@ class MultipartUpload(object):
                 'CONTENT-LENGTH': str(len(data)),
                 'HOST': self.bucket._host,
                 'CONTENT-TYPE': 'application/xml',
-            }, payload=data))
+            }, payload=data,
+            scheme=self.bucket._scheme))
         try:
             xml = yield from result.read()
             if result.status != 200:
                 raise errors.AWSException.from_bytes(result.status, xml)
-            xml = parse_xml(xml)
-            return xml.find('s3:ETag', namespaces=NS)
+            xml = xmltodict.parse(xml)['CompleteMultipartUploadResult']
+            return xml
         finally:
             result.close()
 
@@ -250,7 +281,7 @@ class MultipartUpload(object):
         result = yield from self.bucket._request(Request("DELETE",
             '/' + self.key, {
                 'uploadId': self.upload_id,
-            }, headers={'HOST': self.bucket._host}, payload=b''))
+            }, headers={'HOST': self.bucket._host}, payload=b'', scheme=self.bucket._scheme))
         try:
             xml = yield from result.read()
             if result.status != 204:
@@ -267,7 +298,9 @@ class Bucket(object):
                  aws_region='us-east-1',
                  aws_endpoint='s3.amazonaws.com',
                  signature=SIGNATURE_V4,
-                 connector=None):
+                 connector=None,
+                 scheme='http',
+                 cred_resolver=None):  # method must return the tuple: (aws_key, aws_secret)
         self._name = name
         self._connector = None
         self._aws_sign_data = {
@@ -276,11 +309,21 @@ class Bucket(object):
             'aws_region': aws_region,
             'aws_service': 's3',
             'aws_bucket': name,
-            }
+        }
+
+        self._scheme = scheme
         self._host = self._name + '.' + aws_endpoint
+        self._cred_resolver = cred_resolver
+
         if port != 80:
             self._host = self._host + ':' + str(port)
+
         self._signature = signature
+
+    def _update_creds(self):
+        if not self._cred_resolver: return
+
+        self._aws_sign_data["aws_key"], self._aws_sign_data["aws_secret"] = self._cred_resolver()
 
     @asyncio.coroutine
     def exists(self, prefix=''):
@@ -292,13 +335,13 @@ class Bucket(object):
              'max-keys': '1'},
             {'HOST': self._host},
             b'',
-            ))
-        data = (yield from result.read())
+            scheme=self._scheme))
+        data = yield from result.read()
         if result.status != 200:
             raise errors.AWSException.from_bytes(result.status, data)
-        x = parse_xml(data)
-        return any(map(Key.from_xml,
-                        x.findall('s3:Contents', namespaces=NS)))
+
+        x = xmltodict.parse(data)['ListBucketResult']
+        return any(map(Key.from_dict, x["Contents"]))
 
     @asyncio.coroutine
     def list(self, prefix='', max_keys=1000):
@@ -309,16 +352,94 @@ class Bucket(object):
              'max-keys': str(max_keys)},
             {'HOST': self._host},
             b'',
+            scheme=self._scheme
             ))
         data = (yield from result.read())
         if result.status != 200:
             raise errors.AWSException.from_bytes(result.status, data)
-        x = parse_xml(data)
-        if x.find('s3:IsTruncated', namespaces=NS).text != 'false':
-            raise AssertionError(
-                "File list is truncated, use bigger max_keys")
-        return list(map(Key.from_xml,
-                        x.findall('s3:Contents', namespaces=NS)))
+
+        x = xmltodict.parse(data)['ListBucketResult']
+
+        if 'IsTruncated' != 'false':
+            raise AssertionError("File list is truncated, use bigger max_keys")
+
+        return list(map(Key.from_dict, x["Contents"]))
+
+    @asyncio.coroutine
+    def head(self, key):
+        if isinstance(key, Key):
+            key = key.key
+
+        result = yield from self._request(Request(
+            "HEAD", '/' + key, {}, {'HOST': self._host}, b'', scheme=self._scheme))
+
+        if result.status != 200:
+            xml = yield from result.read()
+            raise errors.AWSException.from_bytes(
+                result.status, xml)
+
+        obj = {'Metadata': dict()}
+        for h, v in result.headers.items():
+            if not h.startswith('X-AMZ-META-'): continue
+            obj['Metadata'][h[11:].lower()] = v  # boto3 returns keys in lowercase
+
+        return obj
+
+    @asyncio.coroutine
+    def abort_multipart_upload(self, key, upload_id):
+        if isinstance(key, Key):
+            key = key.key
+
+        result = yield from self._request(Request(
+            "DELETE", '/' + key + "uploadId=" + upload_id, {}, {'HOST': self._host}, b'', scheme=self._scheme))
+
+        try:
+            if result.status != 204:
+                xml = yield from result.read()
+                raise errors.AWSException.from_bytes(result.status, xml)
+        finally:
+            result.close()
+
+    def list_multipart_uploads_by_chunks(self, prefix='', max_uploads=1000, callback=None):
+        final = False
+        key_marker = ''
+        upload_id_marker = ''
+
+        @asyncio.coroutine
+        def read_next():
+            nonlocal final, key_marker, upload_id_marker
+
+            query = {'uploads': '', 'max-uploads': str(max_uploads)}
+            if len(prefix):
+                query['prefix'] = prefix
+
+            if len(key_marker):
+                query['key-marker'] = key_marker
+                query['upload-id-market'] = upload_id_marker
+
+            result = yield from self._request(Request(
+                "GET", "/", query,
+                    {'HOST': self._host},
+                    b'',
+                    scheme=self._scheme
+            ))
+
+            data = yield from result.read()
+            if result.status != 200:
+                raise errors.AWSException.from_bytes(result.status, data)
+
+            x = xmltodict.parse(data)['ListMultipartUploadsResult']
+
+            if x['IsTruncated'] == 'false' or len(x['Upload']) == 0:
+                final = True
+            else:
+                key_marker = x['NextKeyMarker']
+                upload_id_marker = x['NextUploadIdMarker']
+
+            return x
+
+        while not final:
+            yield read_next()
 
     def list_by_chunks(self, prefix='', max_keys=1000):
         final = False
@@ -327,6 +448,7 @@ class Bucket(object):
         @asyncio.coroutine
         def read_next():
             nonlocal final, marker
+
             result = yield from self._request(Request(
                 "GET",
                 "/",
@@ -335,18 +457,24 @@ class Bucket(object):
                  'marker': marker},
                 {'HOST': self._host},
                 b'',
-                ))
-            data = (yield from result.read())
+                scheme=self._scheme
+            ))
+            data = yield from result.read()
             if result.status != 200:
                 raise errors.AWSException.from_bytes(result.status, data)
-            x = parse_xml(data)
-            result = list(map(Key.from_xml,
-                            x.findall('s3:Contents', namespaces=NS)))
-            if(x.find('s3:IsTruncated', namespaces=NS).text == 'false' or
-                    len(result) == 0):
+
+            x = xmltodict.parse(data)['ListBucketResult']
+
+            result = list(map(Key.from_dict, x['Contents'])) if "Contents" in x else []
+
+            if x['IsTruncated'] == 'false' or len(result) == 0:
                 final = True
             else:
-                marker = result[-1].key
+                if 'NextMarker' not in x:  # amazon, really?
+                    marker = result[-1].key
+                else:
+                    marker = x['NextMarker']
+
             return result
 
         while not final:
@@ -357,11 +485,16 @@ class Bucket(object):
         if isinstance(key, Key):
             key = key.key
         result = yield from self._request(Request(
-            "GET", '/' + key, {}, {'HOST': self._host}, b''))
+            "GET", '/' + key, {}, {'HOST': self._host}, b'', scheme=self._scheme))
         if result.status != 200:
             raise errors.AWSException.from_bytes(
                 result.status, (yield from result.read()))
         return result
+
+    @asyncio.coroutine
+    def upload_file(self, key, file_path):
+        data = open(file_path, 'rb').read()
+        yield from self.upload(key, data, len(data))
 
     @asyncio.coroutine
     def upload(self, key, data,
@@ -376,19 +509,22 @@ class Bucket(object):
 
         Note: Riak CS doesn't allow to upload files without content_length.
         """
-
         if isinstance(key, Key):
             key = key.key
         if isinstance(data, str):
             data = data.encode('utf-8')
+
         headers = {
             'HOST': self._host,
             'CONTENT-TYPE': content_type,
             }
+
         if content_length is not None:
             headers['CONTENT-LENGTH'] = str(content_length)
+
         result = yield from self._request(Request("PUT", '/' + key, {},
-            headers=headers, payload=data))
+            headers=headers, payload=data, scheme=self._scheme))
+
         try:
             if result.status != 200:
                 xml = yield from result.read()
@@ -402,7 +538,7 @@ class Bucket(object):
         if isinstance(key, Key):
             key = key.key
         result = yield from self._request(Request("DELETE", '/' + key, {},
-            {'HOST': self._host}, b''))
+            {'HOST': self._host}, b'', scheme=self._scheme))
         try:
             if result.status != 204:
                 xml = yield from result.read()
@@ -412,11 +548,31 @@ class Bucket(object):
             result.close()
 
     @asyncio.coroutine
+    def copy(self, copy_source, key):
+        if isinstance(key, Key):
+            key = key.key
+
+        result = yield from self._request(Request("PUT", '/' + key, {},
+            {
+                'HOST': self._host,
+                'x-amz-copy-source': copy_source,
+             }, b'',
+            scheme=self._scheme
+        ))
+        try:
+            xml = yield from result.read()
+            if result.status != 200:
+                raise errors.AWSException.from_bytes(result.status, xml)
+            return xmltodict.parse(xml)["CopyObjectResult"]
+        finally:
+            result.close()
+
+    @asyncio.coroutine
     def get(self, key):
         if isinstance(key, Key):
             key = key.key
         result = yield from self._request(Request(
-            "GET", '/' + key, {}, {'HOST': self._host}, b''))
+            "GET", '/' + key, {}, {'HOST': self._host}, b'', scheme=self._scheme))
         if result.status != 200:
             raise errors.AWSException.from_bytes(
                 result.status, (yield from result.read()))
@@ -425,6 +581,8 @@ class Bucket(object):
 
     @asyncio.coroutine
     def _request(self, req):
+        self._update_creds()
+
         _SIGNATURES[self._signature](req, **self._aws_sign_data)
         if isinstance(req.payload, bytes):
             req.headers['CONTENT-LENGTH'] = str(len(req.payload))
@@ -437,24 +595,35 @@ class Bucket(object):
     @asyncio.coroutine
     def upload_multipart(self, key,
             content_type='application/octed-stream',
-            MultipartUpload=MultipartUpload):
+            MultipartUpload=MultipartUpload,
+            metadata={}):
         """Upload file to S3 by uploading multiple chunks"""
 
         if isinstance(key, Key):
             key = key.key
-        result = yield from self._request(Request("POST",
-            '/' + key, {'uploads': ''}, {
+
+        q_obj = {
             'HOST': self._host,
             'CONTENT-TYPE': content_type,
-            }, payload=b''))
+        }
+
+        for n, v in metadata.items():
+            q_obj["x-amz-meta-" + n] = v
+
+        result = yield from self._request(Request("POST",
+            '/' + key, {'uploads': ''}, q_obj, payload=b'', scheme=self._scheme))
+
         try:
             if result.status != 200:
                 xml = yield from result.read()
                 raise errors.AWSException.from_bytes(result.status, xml)
+
             xml = yield from result.read()
-            upload_id = parse_xml(xml).find('s3:UploadId',
-                                            namespaces=NS).text
-            assert upload_id, xml
+            xml = xmltodict.parse(xml)['InitiateMultipartUploadResult']
+
+            upload_id = xml['UploadId']
+
+            assert upload_id
             return MultipartUpload(self, key, upload_id)
         finally:
             result.close()

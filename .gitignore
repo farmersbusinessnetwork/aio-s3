@@ -1,6 +1,6 @@
 /.vagga
 /test.py
 __pycache__
-
+*.egg-info/
 /dist
 /MANIFEST
