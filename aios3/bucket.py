@@ -230,7 +230,6 @@ class MultipartUpload(object):
             isCopy = True
         else:
             headers['CONTENT-LENGTH'] = str(len(data))
-            
 
         result = yield from self.bucket._request(Request("PUT",
             '/' + self.key, {
@@ -240,7 +239,7 @@ class MultipartUpload(object):
         try:
             xml = yield from result.read()
             if result.status != 200:
-                raise errors.AWSException.from_bytes(result.status, xml, self.key + ":" +str(partNumber))
+                raise errors.AWSException.from_bytes(result.status, xml, self.key + ":" + str(partNumber))
             if not isCopy:
                 etag = result.headers['ETAG']   # per AWS docs get the etag from the headers
             else:
@@ -390,7 +389,6 @@ class Bucket(object):
 
         return list(map(Key.from_dict, x["Contents"]))
 
-
     def list_by_chunks(self, prefix='', max_keys=1000):
         final = False
         marker = ''
@@ -523,7 +521,7 @@ class Bucket(object):
         try:
             if result.status != 204:
                 xml = yield from result.read()
-                raise errors.AWSException.from_bytes(result.status, xml)
+                raise errors.AWSException.from_bytes(result.status, xml, key)
             return result
         finally:
             yield from result.wait_for_close()
@@ -542,7 +540,7 @@ class Bucket(object):
         try:
             xml = yield from result.read()
             if result.status != 200:
-                raise errors.AWSException.from_bytes(result.status, xml)
+                raise errors.AWSException.from_bytes(result.status, xml, key)
             return xmltodict.parse(xml)["CopyObjectResult"]
         finally:
             yield from result.wait_for_close()
@@ -593,13 +591,12 @@ class Bucket(object):
         for n, v in metadata.items():
             q_obj["x-amz-meta-" + n] = v
 
-        result = yield from self._request(Request("POST",
-            '/' + key, {'uploads': ''}, q_obj, payload=b''))
+        result = yield from self._request(Request("POST", '/' + key, {'uploads': ''}, q_obj, payload=b''))
 
         try:
             if result.status != 200:
                 xml = yield from result.read()
-                raise errors.AWSException.from_bytes(result.status, xml)
+                raise errors.AWSException.from_bytes(result.status, xml, key)
             xml = yield from result.read()
             xml = xmltodict.parse(xml)['InitiateMultipartUploadResult']
 
@@ -616,16 +613,16 @@ class Bucket(object):
             key = key.key
 
         result = yield from self._request(Request(
-            "DELETE", '/' + key + "uploadId=" + upload_id, {}, {'HOST': self._host}, b'', scheme=self._scheme))
+            "DELETE", '/' + key + "uploadId=" + upload_id, {}, {'HOST': self._host}, b''))
 
         try:
             if result.status != 204:
                 xml = yield from result.read()
-                raise errors.AWSException.from_bytes(result.status, xml)
+                raise errors.AWSException.from_bytes(result.status, xml, key)
         finally:
             yield from result.wait_for_close()
 
-    def list_multipart_uploads_by_chunks(self, prefix='', max_uploads=1000, callback=None):
+    def list_multipart_uploads_by_chunks(self, prefix='', max_uploads=1000):
         final = False
         key_marker = ''
         upload_id_marker = ''
@@ -644,9 +641,8 @@ class Bucket(object):
 
             result = yield from self._request(Request(
                 "GET", "/", query,
-                    {'HOST': self._host},
-                    b'',
-                    scheme=self._scheme
+                {'HOST': self._host},
+                b''
             ))
 
             try:
