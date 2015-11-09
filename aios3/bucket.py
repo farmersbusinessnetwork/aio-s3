@@ -245,9 +245,9 @@ class MultipartUpload(object):
                 etag = result.headers['ETAG']   # per AWS docs get the etag from the headers
             else:
                 # Per AWS docs if copy case need to get the etag from the XML response
-            	xml = xmltodict.parse(xml)["CopyPartResult"]
-            	etag = xml["ETag"]
-            	if etag.startswith("\""): etag = etag[1:-1]
+                xml = xmltodict.parse(xml)["CopyPartResult"]
+                etag = xml["ETag"]
+                if etag.startswith("\""): etag = etag[1:-1]
         finally:
             yield from result.wait_for_close()
             
@@ -311,7 +311,7 @@ def getLocation(name, *, port=80, aws_key, aws_secret, connector=None):
         if result.status != 200:
             raise errors.AWSException.from_bytes(result.status, data, b._name)
 
-		xml = xmltodict.parse(xml)['LocationConstraint']
+        xml = xmltodict.parse(xml)['LocationConstraint']
         region = xml
         if (region is None) or (len(region) == 0):
             return 'us-east-1'
@@ -409,51 +409,51 @@ class Bucket(object):
                 b'',
             ))
 
-			try:
-	            data = yield from result.read()
-    	        if result.status != 200:
-        	        raise errors.AWSException.from_bytes(result.status, data, self._name)
-	            x = xmltodict.parse(data)['ListBucketResult']
+            try:
+                data = yield from result.read()
+                if result.status != 200:
+                    raise errors.AWSException.from_bytes(result.status, data, self._name)
+                x = xmltodict.parse(data)['ListBucketResult']
 
-    	        result = list(map(Key.from_dict, x['Contents'])) if "Contents" in x else []
+                result = list(map(Key.from_dict, x['Contents'])) if "Contents" in x else []
 
-        	    if x['IsTruncated'] == 'false' or len(result) == 0:
-            	    final = True
-	            else:
-    	            if 'NextMarker' not in x:  # amazon, really?
-        	            marker = result[-1].key
-            	    else:
-                	    marker = x['NextMarker']
+                if x['IsTruncated'] == 'false' or len(result) == 0:
+                    final = True
+                else:
+                    if 'NextMarker' not in x:  # amazon, really?
+                        marker = result[-1].key
+                    else:
+                        marker = x['NextMarker']
 
-	            return result
-			finally:
-				yield from result.wait_for_close()
+                return result
+            finally:
+                yield from result.wait_for_close()
 
         while not final:
             yield read_next()
 
     @asyncio.coroutine
-    def head(self, key):
-        if isinstance(key, Key, versionId=None):
+    def head(self, key, versionId=None):
+        if isinstance(key, Key):
             key = key.key
 
         params = {} if versionId is None else {'versionId' : versionId}
         result = yield from self._request(Request(
             "HEAD", '/' + key, params, {'HOST': self._host}, b''))
 
-		try:
-	        if result.status != 200:
-    	        xml = yield from result.read()
-        	    raise errors.AWSException.from_bytes(result.status, xml, key)
+        try:
+            if result.status != 200:
+                xml = yield from result.read()
+                raise errors.AWSException.from_bytes(result.status, xml, key)
 
-	        obj = {'Metadata': dict()}
-    	    for h, v in result.headers.items():
-        	    if not h.startswith('X-AMZ-META-'): continue
-	            obj['Metadata'][h[11:].lower()] = v  # boto3 returns keys in lowercase
-		
-	        return obj
-		finally:
-			yield from result.wait_for_close()
+            obj = {'Metadata': dict()}
+            for h, v in result.headers.items():
+                if not h.startswith('X-AMZ-META-'): continue
+                obj['Metadata'][h[11:].lower()] = v  # boto3 returns keys in lowercase
+        
+            return obj
+        finally:
+            yield from result.wait_for_close()
 
 
     @asyncio.coroutine
@@ -464,13 +464,13 @@ class Bucket(object):
         result = yield from self._request(Request(
             "GET", '/' + key, params, {'HOST': self._host}, b''))
 
-		try:
-	        if result.status != 200:
-    	        raise errors.AWSException.from_bytes(
-        	        result.status, (yield from result.read()), key)
-        	return result
-		finally:
-			yield from result.wait_for_close()
+        try:
+            if result.status != 200:
+                raise errors.AWSException.from_bytes(
+                    result.status, (yield from result.read()), key)
+            return result
+        finally:
+            yield from result.wait_for_close()
 
     @asyncio.coroutine
     def upload_file(self, key, file_path):
@@ -554,14 +554,14 @@ class Bucket(object):
         result = yield from self._request(Request(
             "GET", '/' + key, {}, {'HOST': self._host}, b''))
 
-		try:
-	        if result.status != 200:
-    	        raise errors.AWSException.from_bytes(
-        	        result.status, (yield from result.read()), key)
-	        data = yield from result.read()
-    	    return data
-		finally:
-			yield from result.wait_for_close()
+        try:
+            if result.status != 200:
+                raise errors.AWSException.from_bytes(
+                    result.status, (yield from result.read()), key)
+            data = yield from result.read()
+            return data
+        finally:
+            yield from result.wait_for_close()
 
     @asyncio.coroutine
     def _request(self, req):
@@ -649,20 +649,20 @@ class Bucket(object):
                     scheme=self._scheme
             ))
 
-			try:
-	            data = yield from result.read()
-	            if result.status != 200:
-	                raise errors.AWSException.from_bytes(result.status, data)
+            try:
+                data = yield from result.read()
+                if result.status != 200:
+                    raise errors.AWSException.from_bytes(result.status, data)
 
-	            x = xmltodict.parse(data)['ListMultipartUploadsResult']
+                x = xmltodict.parse(data)['ListMultipartUploadsResult']
 
-	            if x['IsTruncated'] == 'false' or len(x['Upload']) == 0:
-	                final = True
-	            else:
-	                key_marker = x['NextKeyMarker']
-	                upload_id_marker = x['NextUploadIdMarker']
-			finally:
-				yield from result.wait_for_close()
+                if x['IsTruncated'] == 'false' or len(x['Upload']) == 0:
+                    final = True
+                else:
+                    key_marker = x['NextKeyMarker']
+                    upload_id_marker = x['NextUploadIdMarker']
+            finally:
+                yield from result.wait_for_close()
 
             return x
 
