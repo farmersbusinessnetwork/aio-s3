@@ -4,6 +4,7 @@ import base64
 import hashlib
 import asyncio
 import xmltodict
+import collections
 
 from functools import partial
 from urllib.parse import quote
@@ -24,6 +25,12 @@ SIG_V2_SUBRESOURCES = {
     'partNumber', 'policy', 'requestPayment', 'torrent', 'uploadId',
     'uploads', 'versionId', 'versioning', 'versions', 'website'
     }
+
+
+def _safe_list(obj):
+    if isinstance(obj, collections.OrderedDict):
+        return [obj]
+    return obj
 
 
 class Key(object):
@@ -178,7 +185,7 @@ def sign_v2(req, aws_key, aws_secret, aws_bucket, **_):
 
 class ObjectChunk(object):
     def __init__(self, bucket, key, firstByte, lastByte, versionId=None):
-        if (isinstance(bucket, Bucket)):
+        if isinstance(bucket, Bucket):
             bucket = bucket._name
         self.bucket = bucket
         self.key = key
@@ -187,9 +194,7 @@ class ObjectChunk(object):
         self.versionId = versionId
 
 
-
 class MultipartUpload(object):
-
     def __init__(self, bucket, key, upload_id):
         self.bucket = bucket
         self.key = key
@@ -231,24 +236,24 @@ class MultipartUpload(object):
         else:
             headers['CONTENT-LENGTH'] = str(len(data))
 
-        result = yield from self.bucket._request(Request("PUT",
+        response = yield from self.bucket._request(Request("PUT",
             '/' + self.key, {
                 'uploadId': self.upload_id,
                 'partNumber': str(partNumber),
             }, headers=headers, payload=data))
         try:
-            xml = yield from result.read()
-            if result.status != 200:
-                raise errors.AWSException.from_bytes(result.status, xml, self.key + ":" + str(partNumber))
+            xml = yield from response.read()
+            if response.status != 200:
+                raise errors.AWSException.from_bytes(response.status, xml, self.key + ":" + str(partNumber))
             if not isCopy:
-                etag = result.headers['ETAG']   # per AWS docs get the etag from the headers
+                etag = response.headers['ETAG']   # per AWS docs get the etag from the headers
             else:
                 # Per AWS docs if copy case need to get the etag from the XML response
                 xml = xmltodict.parse(xml)["CopyPartResult"]
                 etag = xml["ETag"]
                 if etag.startswith("\""): etag = etag[1:-1]
         finally:
-            yield from result.wait_for_close()
+            yield from response.wait_for_close()
             
         self.parts[partNumber] = etag
         
@@ -260,10 +265,12 @@ class MultipartUpload(object):
 
         self.parts = [{'PartNumber': n, 'ETag': etag} for n, etag in self.parts.items()]
         self.parts = sorted(self.parts, key=lambda x: x['PartNumber'])
-        self.xml = {"CompleteMultipartUpload": {'Part': self.parts}}
-        data = xmltodict.unparse(self.xml, full_document=False).encode('utf8')
 
-        result = yield from self.bucket._request(Request("POST",
+        xml = {"CompleteMultipartUpload": {'Part': self.parts}}
+
+        data = xmltodict.unparse(xml, full_document=False).encode('utf8')
+
+        response = yield from self.bucket._request(Request("POST",
             '/' + self.key, {
                 'uploadId': self.upload_id,
             }, headers={
@@ -272,54 +279,60 @@ class MultipartUpload(object):
                 'CONTENT-TYPE': 'application/xml',
             }, payload=data))
         try:
-            xml = yield from result.read()
-            if result.status != 200:
-                raise errors.AWSException.from_bytes(result.status, xml, self.key)
-            xml = xmltodict.parse(xml)['CompleteMultipartUploadResult']
-            return xml
+            data = yield from response.read()
+            if response.status != 200:
+                raise errors.AWSException.from_bytes(response.status, data, self.key)
+            data = xmltodict.parse(data)['CompleteMultipartUploadResult']
+            return data
         finally:
-            yield from result.wait_for_close()
+            yield from response.wait_for_close()
 
     @asyncio.coroutine
     def close(self):
         if self._done:
             return
+
         self._done = True
-        result = yield from self.bucket._request(Request("DELETE",
+
+        response = yield from self.bucket._request(Request("DELETE",
             '/' + self.key, {
                 'uploadId': self.upload_id,
             }, headers={'HOST': self.bucket._host}, payload=b''))
         try:
-            xml = yield from result.read()
-            if result.status != 204:
-                raise errors.AWSException.from_bytes(result.status, xml, self.key)
+            xml = yield from response.read()
+            if response.status != 204:
+                raise errors.AWSException.from_bytes(response.status, xml, self.key)
         finally:
-            yield from result.wait_for_close()
+            yield from response.wait_for_close()
+
 
 @asyncio.coroutine
 def getLocation(name, *, port=80, aws_key, aws_secret, connector=None):
     b = Bucket(name=name, port=port, aws_key=aws_key, aws_secret=aws_secret, connector=connector, signature=SIGNATURE_V2)
+
     request = Request("GET", "/", {'location' : None}, {'HOST': b._host}, b'')
     # whack the params field because the constructor set it wrong.
     request.params = {'location' : None}
     # whack the query_string field because the constructor set it wrong.
     request.query_string = "location"
-    result = yield from b._request(request)
-    try:
-        data = yield from result.read()
-        if result.status != 200:
-            raise errors.AWSException.from_bytes(result.status, data, b._name)
 
-        xml = xmltodict.parse(xml)['LocationConstraint']
-        region = xml
+    response = yield from b._request(request)
+
+    try:
+        data = yield from response.read()
+        if response.status != 200:
+            raise errors.AWSException.from_bytes(response.status, data, b._name)
+
+        region = xmltodict.parse(data)['LocationConstraint']
         if (region is None) or (len(region) == 0):
             return 'us-east-1'
+
         return region
     finally:
-        yield from result.wait_for_close()
+        yield from response.wait_for_close()
+
 
 class Bucket(object):
-
     def __init__(self, name, *,
                  port=80,
                  aws_key, aws_secret,
@@ -354,7 +367,7 @@ class Bucket(object):
 
     @asyncio.coroutine
     def exists(self, prefix=''):
-        result = yield from self._request(Request(
+        response = yield from self._request(Request(
             "GET",
             "/",
             {'prefix': prefix,
@@ -362,32 +375,40 @@ class Bucket(object):
              'max-keys': '1'},
             {'HOST': self._host},
             b''))
-        data = yield from result.read()
-        if result.status != 200:
-            raise errors.AWSException.from_bytes(result.status, data, self._name)
-        x = xmltodict.parse(data)['ListBucketResult']
-        return any(map(Key.from_dict, x["Contents"]))
+
+        try:
+            data = yield from response.read()
+            if response.status != 200:
+                raise errors.AWSException.from_bytes(response.status, data, self._name)
+            x = xmltodict.parse(data)['ListBucketResult']
+            return any(map(Key.from_dict, x["Contents"]))
+        finally:
+            yield from response.wait_for_close()
 
     @asyncio.coroutine
     def list(self, prefix='', max_keys=1000):
-        result = yield from self._request(Request(
+        response = yield from self._request(Request(
             "GET",
             "/",
             {'prefix': prefix,
              'max-keys': str(max_keys)},
             {'HOST': self._host},
             b'',
-            ))
-        data = (yield from result.read())
-        if result.status != 200:
-            raise errors.AWSException.from_bytes(result.status, data, self._name)
+        ))
 
-        x = xmltodict.parse(data)['ListBucketResult']
+        try:
+            data = yield from response.read()
+            if response.status != 200:
+                raise errors.AWSException.from_bytes(response.status, data, self._name)
 
-        if 'IsTruncated' != 'false':
-            raise AssertionError("File list is truncated, use bigger max_keys")
+            x = xmltodict.parse(data)['ListBucketResult']
 
-        return list(map(Key.from_dict, x["Contents"]))
+            if 'IsTruncated' != 'false':
+                raise AssertionError("File list is truncated, use bigger max_keys")
+
+            return list(map(Key.from_dict, _safe_list(x["Contents"])))
+        finally:
+            yield from response.wait_for_close()
 
     def list_by_chunks(self, prefix='', max_keys=1000):
         final = False
@@ -397,7 +418,7 @@ class Bucket(object):
         def read_next():
             nonlocal final, marker
 
-            result = yield from self._request(Request(
+            response = yield from self._request(Request(
                 "GET",
                 "/",
                 {'prefix': prefix,
@@ -408,12 +429,12 @@ class Bucket(object):
             ))
 
             try:
-                data = yield from result.read()
-                if result.status != 200:
-                    raise errors.AWSException.from_bytes(result.status, data, self._name)
+                data = yield from response.read()
+                if response.status != 200:
+                    raise errors.AWSException.from_bytes(response.status, data, self._name)
                 x = xmltodict.parse(data)['ListBucketResult']
 
-                result = list(map(Key.from_dict, x['Contents'])) if "Contents" in x else []
+                result = list(map(Key.from_dict, _safe_list(x['Contents']))) if "Contents" in x else []
 
                 if x['IsTruncated'] == 'false' or len(result) == 0:
                     final = True
@@ -425,7 +446,7 @@ class Bucket(object):
 
                 return result
             finally:
-                yield from result.wait_for_close()
+                yield from response.wait_for_close()
 
         while not final:
             yield read_next()
@@ -436,39 +457,38 @@ class Bucket(object):
             key = key.key
 
         params = {} if versionId is None else {'versionId' : versionId}
-        result = yield from self._request(Request(
+        response = yield from self._request(Request(
             "HEAD", '/' + key, params, {'HOST': self._host}, b''))
 
         try:
-            if result.status != 200:
-                xml = yield from result.read()
-                raise errors.AWSException.from_bytes(result.status, xml, key)
+            if response.status != 200:
+                xml = yield from response.read()
+                raise errors.AWSException.from_bytes(response.status, xml, key)
 
             obj = {'Metadata': dict()}
-            for h, v in result.headers.items():
+            for h, v in response.headers.items():
                 if not h.startswith('X-AMZ-META-'): continue
                 obj['Metadata'][h[11:].lower()] = v  # boto3 returns keys in lowercase
         
             return obj
         finally:
-            yield from result.wait_for_close()
-
+            yield from response.wait_for_close()
 
     @asyncio.coroutine
     def download(self, key, versionId=None):
         if isinstance(key, Key):
             key = key.key
         params = {} if versionId is None else {'versionId' : versionId}
-        result = yield from self._request(Request(
+        response = yield from self._request(Request(
             "GET", '/' + key, params, {'HOST': self._host}, b''))
 
         try:
-            if result.status != 200:
+            if response.status != 200:
                 raise errors.AWSException.from_bytes(
-                    result.status, (yield from result.read()), key)
-            return result
+                    response.status, (yield from response.read()), key)
+            return response
         finally:
-            yield from result.wait_for_close()
+            yield from response.wait_for_close()
 
     @asyncio.coroutine
     def upload_file(self, key, file_path):
@@ -501,65 +521,68 @@ class Bucket(object):
         if content_length is not None:
             headers['CONTENT-LENGTH'] = str(content_length)
 
-        result = yield from self._request(Request("PUT", '/' + key, {},
+        response = yield from self._request(Request("PUT", '/' + key, {},
             headers=headers, payload=data))
 
         try:
-            if result.status != 200:
-                xml = yield from result.read()
-                raise errors.AWSException.from_bytes(result.status, xml, key)
-            return result
+            if response.status != 200:
+                xml = yield from response.read()
+                raise errors.AWSException.from_bytes(response.status, xml, key)
+
+            return response
         finally:
-            yield from result.wait_for_close()
+            yield from response.wait_for_close()
 
     @asyncio.coroutine
     def delete(self, key):
         if isinstance(key, Key):
             key = key.key
-        result = yield from self._request(Request("DELETE", '/' + key, {},
-            {'HOST': self._host}, b''))
+
+        response = yield from self._request(Request("DELETE", '/' + key, {}, {'HOST': self._host}, b''))
+
         try:
-            if result.status != 204:
-                xml = yield from result.read()
-                raise errors.AWSException.from_bytes(result.status, xml, key)
-            return result
+            if response.status != 204:
+                xml = yield from response.read()
+                raise errors.AWSException.from_bytes(response.status, xml, key)
+            return response
         finally:
-            yield from result.wait_for_close()
+            yield from response.wait_for_close()
 
     @asyncio.coroutine
     def copy(self, copy_source, key):
         if isinstance(key, Key):
             key = key.key
 
-        result = yield from self._request(Request("PUT", '/' + key, {},
+        response = yield from self._request(Request("PUT", '/' + key, {},
             {
                 'HOST': self._host,
                 'x-amz-copy-source': copy_source,
-             }, b'',
+            }, b'',
         ))
+
         try:
-            xml = yield from result.read()
-            if result.status != 200:
-                raise errors.AWSException.from_bytes(result.status, xml, key)
+            xml = yield from response.read()
+            if response.status != 200:
+                raise errors.AWSException.from_bytes(response.status, xml, key)
             return xmltodict.parse(xml)["CopyObjectResult"]
         finally:
-            yield from result.wait_for_close()
+            yield from response.wait_for_close()
 
     @asyncio.coroutine
     def get(self, key):
         if isinstance(key, Key):
             key = key.key
-        result = yield from self._request(Request(
+        response = yield from self._request(Request(
             "GET", '/' + key, {}, {'HOST': self._host}, b''))
 
         try:
-            if result.status != 200:
+            if response.status != 200:
                 raise errors.AWSException.from_bytes(
-                    result.status, (yield from result.read()), key)
-            data = yield from result.read()
+                    response.status, (yield from response.read()), key)
+            data = yield from response.read()
             return data
         finally:
-            yield from result.wait_for_close()
+            yield from response.wait_for_close()
 
     @asyncio.coroutine
     def _request(self, req):
@@ -591,13 +614,13 @@ class Bucket(object):
         for n, v in metadata.items():
             q_obj["x-amz-meta-" + n] = v
 
-        result = yield from self._request(Request("POST", '/' + key, {'uploads': ''}, q_obj, payload=b''))
+        response = yield from self._request(Request("POST", '/' + key, {'uploads': ''}, q_obj, payload=b''))
 
         try:
-            if result.status != 200:
-                xml = yield from result.read()
-                raise errors.AWSException.from_bytes(result.status, xml, key)
-            xml = yield from result.read()
+            if response.status != 200:
+                xml = yield from response.read()
+                raise errors.AWSException.from_bytes(response.status, xml, key)
+            xml = yield from response.read()
             xml = xmltodict.parse(xml)['InitiateMultipartUploadResult']
 
             upload_id = xml['UploadId']
@@ -605,22 +628,22 @@ class Bucket(object):
             assert upload_id
             return MultipartUpload(self, key, upload_id)
         finally:
-            yield from result.wait_for_close()
+            yield from response.wait_for_close()
 
     @asyncio.coroutine
     def abort_multipart_upload(self, key, upload_id):
         if isinstance(key, Key):
             key = key.key
 
-        result = yield from self._request(Request(
+        response = yield from self._request(Request(
             "DELETE", '/' + key + "uploadId=" + upload_id, {}, {'HOST': self._host}, b''))
 
         try:
-            if result.status != 204:
-                xml = yield from result.read()
-                raise errors.AWSException.from_bytes(result.status, xml, key)
+            if response.status != 204:
+                xml = yield from response.read()
+                raise errors.AWSException.from_bytes(response.status, xml, key)
         finally:
-            yield from result.wait_for_close()
+            yield from response.wait_for_close()
 
     def list_multipart_uploads_by_chunks(self, prefix='', max_uploads=1000):
         final = False
@@ -639,16 +662,16 @@ class Bucket(object):
                 query['key-marker'] = key_marker
                 query['upload-id-market'] = upload_id_marker
 
-            result = yield from self._request(Request(
+            response = yield from self._request(Request(
                 "GET", "/", query,
                 {'HOST': self._host},
                 b''
             ))
 
             try:
-                data = yield from result.read()
-                if result.status != 200:
-                    raise errors.AWSException.from_bytes(result.status, data)
+                data = yield from response.read()
+                if response.status != 200:
+                    raise errors.AWSException.from_bytes(response.status, data)
 
                 x = xmltodict.parse(data)['ListMultipartUploadsResult']
 
@@ -657,10 +680,10 @@ class Bucket(object):
                 else:
                     key_marker = x['NextKeyMarker']
                     upload_id_marker = x['NextUploadIdMarker']
-            finally:
-                yield from result.wait_for_close()
 
-            return x
+                return x
+            finally:
+                yield from response.wait_for_close()
 
         while not final:
             yield read_next()
