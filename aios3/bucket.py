@@ -360,6 +360,9 @@ class Bucket(object):
         self._signature = signature
         self._session = aiohttp.ClientSession(connector=connector)
 
+    def __del__(self):
+        self._session.close()  # why is this not implicit?
+
     def _update_creds(self):
         if not self._cred_resolver: return
 
