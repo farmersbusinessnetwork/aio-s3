@@ -1,5 +1,5 @@
-from xml.etree.ElementTree import fromstring as parse_xml, ParseError
-
+from xml.etree.ElementTree import ParseError
+import xmltodict
 
 class AWSException(Exception):
     """Base for exceptions returned by amazon"""
@@ -9,25 +9,29 @@ class AWSException(Exception):
         if not body:
             # sometimes Riak CS doesn't have response body :(
             # TODO(tailhook) maybe use status to create specific error?
-            if (status != 404):
+            if status != 404:
                 raise RuntimeError("HTTP Error {}".format(status))
             else:
                 raise NotFound()
         try:
-            xml = parse_xml(body)
-        except ParseError:
+            xml = xmltodict.parse(body)
+
+        except:
             raise RuntimeError(body)
-        code_el = xml.find("Code")
-        if code_el is None or not code_el.text:
+
+        error = xml['Error'] if 'Error' in xml else None
+
+        class_name = error['Code'] if 'Code' in error else None
+        if class_name is None or not len(class_name):
             raise RuntimeError(body)
-        class_name = code_el.text
+
         try:
             cls = globals()[class_name]
         except KeyError:
             raise RuntimeError("Error {} is unknown".format(class_name))
-        msg = xml.find("Message")
-        msg = class_name if msg is None else msg.text
-        if (url is not None):
+
+        msg = error['Message'] if 'Message' in error else class_name
+        if url is not None:
             msg = url + " " + msg
         return cls(msg)
 
