@@ -442,7 +442,7 @@ class Bucket(object):
             except:
                 # yes, we get multiple types of exceptions
                 retries += 1
-                self._logger.exception('Retrying {}/{} on s3 request: {}'.format(retries, self._num_retries, url))
+                self._logger.warning('Retrying {}/{} on s3 request: {}'.format(retries, self._num_retries, url))
                 if retries == self._num_retries:
                     raise
 
