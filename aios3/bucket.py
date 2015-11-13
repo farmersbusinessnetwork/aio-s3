@@ -1,11 +1,10 @@
 import datetime
-import hmac
 import logging
-import hashlib
 import asyncio
 import xmltodict
 import collections
 import time
+import botocore.auth
 
 from functools import partial
 from urllib.parse import quote
@@ -14,9 +13,7 @@ import aiohttp
 
 from . import errors
 
-
 amz_uriencode = partial(quote, safe='~')
-amz_uriencode_slash = partial(quote, safe='~/')
 
 
 def _safe_list(obj):
@@ -26,7 +23,6 @@ def _safe_list(obj):
 
 
 class Key(object):
-
     def __init__(self, *, key, last_modified, etag, size, storage_class):
         self.key = key
         self.last_modified = last_modified
@@ -43,77 +39,6 @@ class Key(object):
 
     def __repr__(self):
         return '<Key {}:{}>'.format(self.key, self.size)
-
-
-def _hmac(key, val):
-    return hmac.new(key, val, hashlib.sha256).digest()
-
-
-def _signkey(key, date, region, service):
-    date_key = _hmac(("AWS4" + key).encode('ascii'),
-                        date.encode('ascii'))
-    date_region_key = _hmac(date_key, region.encode('ascii'))
-    svc_key = _hmac(date_region_key, service.encode('ascii'))
-    return _hmac(svc_key, b'aws4_request')
-
-
-def sign_v4(verb, resource, query_string, headers, payload, aws_key, aws_secret, aws_service='s3', aws_region='us-east-1', **_):
-    time = datetime.datetime.utcnow()
-    date = time.strftime('%Y%m%d')
-    timestr = time.strftime("%Y%m%dT%H%M%SZ")
-    headers['x-amz-date'] = timestr
-
-    if isinstance(payload, bytes):
-        payloadhash = hashlib.sha256(payload).hexdigest()
-    else:
-        payloadhash = 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD'
-
-    headers['x-amz-content-sha256'] = payloadhash
-
-    signing_key = _signkey(aws_secret, date, aws_region, aws_service)
-    header_names = ';'.join(k.lower() for k in sorted(headers))
-    header_str = '\n'.join(k.lower() + ':' + headers[k].strip() for k in sorted(headers))
-
-    creq = (
-        "{verb}\n"
-        "{resource}\n"
-        "{query_string}\n"
-        "{header_str}\n\n"
-        "{header_names}\n"
-        "{payloadhash}".format(
-            verb=verb,
-            resource=resource,
-            query_string=query_string,
-            header_str=header_str,
-            header_names=header_names,
-            payloadhash=payloadhash,
-        )
-    )
-
-    string_to_sign = (
-        "AWS4-HMAC-SHA256\n{ts}\n"
-        "{date}/{region}/{service}/aws4_request\n"
-        "{reqhash}".format(
-            ts=timestr,
-            date=date,
-            region=aws_region,
-            service=aws_service,
-            reqhash=hashlib.sha256(creq.encode('ascii')).hexdigest(),
-        )
-    )
-
-    sig = hmac.new(signing_key, string_to_sign.encode('ascii'), hashlib.sha256).hexdigest()
-
-    ahdr = ('AWS4-HMAC-SHA256 '
-        'Credential={key}/{date}/{region}/{service}/aws4_request, '
-        'SignedHeaders={headers}, Signature={sig}'.format(
-            key=aws_key, date=date, region=aws_region, service=aws_service,
-            headers=header_names,
-            sig=sig,
-        )
-    )
-
-    headers['Authorization'] = ahdr
 
 
 class ObjectChunk(object):
@@ -158,23 +83,23 @@ class MultipartUpload(object):
             'CONTENT-TYPE': 'application/octed-stream',
         }
 
-        isCopy = False
+        is_copy = False
         if isinstance(data, ObjectChunk):
             objChunk = data
             data = b''
             srcPath = "/{0}/{1}".format(objChunk.bucket, amz_uriencode(objChunk.key))
-            if (objChunk.versionId is not None):
+            if objChunk.versionId is not None:
                 srcPath = srcPath + "?versionId={0}".format(objChunk.versionId)
             headers['x-amz-copy-source'] = srcPath
             headers['x-amz-copy-source-range'] = "bytes={0}-{1}".format(objChunk.firstByte, objChunk.lastByte)
-            isCopy = True
+            is_copy = True
 
         response, xml = yield from self.bucket._request("PUT", '/' + self.key, {
                 'uploadId': self.upload_id,
                 'partNumber': str(part_num),
             }, headers=headers, payload=data)
 
-        if not isCopy:
+        if not is_copy:
             etag = response.headers['ETAG']   # per AWS docs get the etag from the headers
         else:
             # Per AWS docs if copy case need to get the etag from the XML response
@@ -216,15 +141,17 @@ class MultipartUpload(object):
 
 class Bucket(object):
     def __init__(self, name, *,
-                 port=80,
-                 aws_key, aws_secret,
+                 aws_key=None, aws_secret=None,
                  aws_region='us-east-1',
-                 aws_endpoint='s3.amazonaws.com',
                  connector=None,
                  scheme='http',
-                 cred_resolver=None,
+                 boto_creds=None,
                  logger=None,
                  num_retries=5):  # method must return the tuple: (aws_key, aws_secret)
+
+        if (aws_key is None or aws_secret is None) and boto_creds is None:
+            raise Exception('You must specify aws_key/aws_secret or boto_creds')
+
         if logger is None: logger = logging.logger('aio-s3')
         self._logger = logger
         self._name = name
@@ -232,36 +159,40 @@ class Bucket(object):
         self._num_retries = num_retries
         self._num_requests = 0
 
-        self._aws_sign_data = {
-            'aws_key': aws_key,
-            'aws_secret': aws_secret,
-            'aws_region': aws_region,
-            'aws_service': 's3',
-        }
+        self._aws_region = aws_region
+        self._aws_key = aws_key
+        self._aws_secret = aws_secret
+        self._boto_creds = boto_creds
+
+        # Virtual style host URL
+        # ----------------------
+        #   endpoint: bucket.s3.amazonaws.com / bucket.s3-aws-region.amazonaws.com
+        #   host: bucket.s3.amazonaws.com
+        #
+        # Path Style
+        # ----------
+        #   endpoint:  s3.amazonaws.com/bucket / s3-aws-region.amazonaws.com/bucket
+        #       host: s3.amazonaws.com
+        #
+
+        # We use Path Style because the Amazon SSL wildcard cert will not match for virtual style with buckets
+        # that have '.'s: http://docs.aws.amazon.com/AmazonS3/latest/dev/BucketRestrictions.html
 
         self._scheme = scheme
-        self._host = self._name + '.' + aws_endpoint
-        self._cred_resolver = cred_resolver
-
-        if port != 80:
-            self._host = self._host + ':' + str(port)
+        self._host = "s3-" + aws_region + ".amazonaws.com"
+        self._endpoint = self._host + "/" + self._name
 
         if self._connector is None:
-            self._connector = aiohttp.TCPConnector(force_close=False, keepalive_timeout=8, use_dns_cache=True)
+            self._connector = aiohttp.TCPConnector(force_close=False, keepalive_timeout=10, use_dns_cache=True)
 
         self._session = aiohttp.ClientSession(connector=self._connector)
 
     def __del__(self):
         self._session.close()  # why is this not implicit?
 
-    def _update_creds(self):
-        if not self._cred_resolver: return
-
-        self._aws_sign_data["aws_key"], self._aws_sign_data["aws_secret"] = self._cred_resolver()
-
     @asyncio.coroutine
     def getLocation(self):
-        response, data = yield from self._request("GET", "/", {'location': None})
+        response, data = yield from self._request("GET", "/", params={'location': ''})
 
         region = xmltodict.parse(data)['LocationConstraint']
         if (region is None) or (len(region) == 0):
@@ -401,28 +332,31 @@ class Bucket(object):
         return xml
 
     @asyncio.coroutine
-    def _request(self, verb, resource, query=None, headers=None, payload=b''):
-        if query is None: query = dict()
+    def _request(self, method, resource, params=None, headers=None, payload=b''):
+        if params is None: params = dict()
         if headers is None: headers = dict()
 
         headers['HOST'] = self._host
         headers['CONTENT-LENGTH'] = str(len(payload))
 
-        resource = amz_uriencode_slash(resource)
-        query_string = '&'.join(k + '=' + v if v is not None else k
-            for k, v in sorted((amz_uriencode(k), amz_uriencode(v) if v is not None else None)
-                               for k, v in query.items()))
+        url = '{}://{}{}'.format(self._scheme, self._endpoint, resource)
 
-        self._update_creds()
+        class S3Request:
+            def __init__(self):
+                self.headers = headers
+                self.params = params
+                self.context = dict()
+                self.body = payload
+                self.method = method
+                self.url = url
 
-        sign_v4(verb, resource, query_string, headers, payload, **self._aws_sign_data)
-
-        url = '{0}://{1}{2}?{3}'.format(self._scheme, headers['HOST'], resource, query_string)
+        signer = botocore.auth.S3SigV4Auth(self._boto_creds, 's3', self._aws_region)
+        req = S3Request()
+        signer.add_auth(req)
 
         response = lambda: None
         response.status = 500
         retries = 0
-        chunked = 'CONTENT-LENGTH' not in headers
         data = b''
 
         # Note: from what I gather these errors are to be expected all the time
@@ -433,11 +367,7 @@ class Bucket(object):
             self._num_requests += 1
 
             try:
-                if self._session is not None:
-                    response = yield from self._session.request(verb, url, chunked=chunked, headers=headers, data=payload)
-                else:
-                    response = yield from aiohttp.request(verb, url, chunked=chunked, headers=headers, data=payload)
-
+                response = yield from self._session.request(req.method, req.url, params=req.params, headers=req.headers, data=req.body)
                 response_elapsed = time.time() - start
             except:
                 # yes, we get multiple types of exceptions
@@ -484,12 +414,11 @@ class Bucket(object):
         if isinstance(key, Key):
             key = key.key
 
-        q_obj = {'CONTENT-TYPE': content_type}
-
+        headers = {'CONTENT-TYPE': content_type}
         for n, v in metadata.items():
-            q_obj["x-amz-meta-" + n] = v
+            headers["x-amz-meta-" + n] = v
 
-        response, xml = yield from self._request("POST", '/' + key, {'uploads': ''}, q_obj)
+        response, xml = yield from self._request("POST", '/' + key, params={'uploads': ''}, headers=headers)
 
         xml = xmltodict.parse(xml)['InitiateMultipartUploadResult']
         upload_id = xml['UploadId']
@@ -513,7 +442,7 @@ class Bucket(object):
         def read_next():
             nonlocal final, key_marker, upload_id_marker
 
-            query = {'uploads': '', 'max-uploads': str(max_uploads)}
+            query = {'max-uploads': str(max_uploads), 'uploads':''}
             if len(prefix):
                 query['prefix'] = prefix
 
@@ -524,6 +453,7 @@ class Bucket(object):
             response, data = yield from self._request("GET", "/", query)
 
             x = xmltodict.parse(data)['ListMultipartUploadsResult']
+            if 'Upload' not in x: x['Upload'] = []
 
             if x['IsTruncated'] == 'false' or len(x['Upload']) == 0:
                 final = True
