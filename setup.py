@@ -14,7 +14,7 @@ setup(name='aio-s3',
       packages=[
           'aios3',
       ],
-      requires=['aiohttp', 'xmltodict'],
+      requires=['aiohttp', 'botocore', 'xmltodict'],
       classifiers=[
           'Development Status :: 4 - Beta',
           'Programming Language :: Python :: 3',
