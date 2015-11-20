@@ -153,15 +153,23 @@ class Bucket(object):
             raise Exception('You must specify aws_key/aws_secret or boto_creds')
 
         if logger is None: logger = logging.logger('aio-s3')
+
+        # TODO: should deprecate aws_key/aws_secret
+        if boto_creds is None:
+            class Creds:
+                def __init__(self):
+                    self.secret_key = aws_secret
+                    self.access_key = aws_key
+                    self.token = None
+
+            boto_creds = Creds()
+
         self._logger = logger
         self._name = name
         self._connector = connector
         self._num_retries = num_retries
         self._num_requests = 0
-
         self._aws_region = aws_region
-        self._aws_key = aws_key
-        self._aws_secret = aws_secret
         self._boto_creds = boto_creds
 
         # Virtual style host URL
@@ -209,11 +217,11 @@ class Bucket(object):
 
     @asyncio.coroutine
     def list(self, prefix='', max_keys=1000):
-        response, data = yield from self._request( "GET", "/", {'prefix': prefix, 'max-keys': str(max_keys)})
+        response, data = yield from self._request("GET", "/", {'prefix': prefix, 'max-keys': str(max_keys)})
 
         x = xmltodict.parse(data)['ListBucketResult']
 
-        if 'IsTruncated' != 'false':
+        if x['IsTruncated'] != 'false':
             raise AssertionError("File list is truncated, use bigger max_keys")
 
         return list(map(Key.from_dict, _safe_list(x["Contents"])))
