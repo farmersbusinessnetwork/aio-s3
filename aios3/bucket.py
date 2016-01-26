@@ -147,7 +147,23 @@ class Bucket(object):
                  scheme='http',
                  boto_creds=None,
                  logger=None,
-                 num_retries=5):  # method must return the tuple: (aws_key, aws_secret)
+                 num_retries=5,
+                 timeout=None):
+        """
+        Bucket class used to access S3 buckets
+
+        @param name: name of bucket to
+        @param aws_key: AWS key to use for authentication
+        @param aws_secret: AWS secret to use for authentication
+        @param aws_region: AWS region to use for communication
+        @param connector:
+        @param scheme: http or https
+        @param boto_creds: botocore credential resolver
+        @param logger:
+        @param num_retries: number of retries for AWS operations
+        @param timeout: aiohttp timeout in seconds
+        @return: aios3 Bucket object
+        """
 
         if (aws_key is None or aws_secret is None) and boto_creds is None:
             raise Exception('You must specify aws_key/aws_secret or boto_creds')
@@ -171,6 +187,7 @@ class Bucket(object):
         self._num_requests = 0
         self._aws_region = aws_region
         self._boto_creds = boto_creds
+        self._timeout = timeout
 
         # Virtual style host URL
         # ----------------------
@@ -375,7 +392,12 @@ class Bucket(object):
             self._num_requests += 1
 
             try:
-                response = yield from self._session.request(req.method, req.url, params=req.params, headers=req.headers, data=req.body)
+                if self._timeout is not None:
+                    with aiohttp.Timeout(self._timeout):
+                        response = yield from self._session.request(req.method, req.url, params=req.params, headers=req.headers, data=req.body)
+                else:
+                    response = yield from self._session.request(req.method, req.url, params=req.params, headers=req.headers, data=req.body)
+
                 response_elapsed = time.time() - start
             except:
                 # yes, we get multiple types of exceptions

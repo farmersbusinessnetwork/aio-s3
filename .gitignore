@@ -1,5 +1,6 @@
 /.vagga
 /test.py
+build/lib/
 __pycache__
 *.egg-info/
 /dist
