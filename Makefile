@@ -8,3 +8,6 @@ clean:
 
 upload:
 	python setup.py sdist upload -r http://repos.fbn.internal:8080/pypi
+
+develop:
+	python3 install -e .

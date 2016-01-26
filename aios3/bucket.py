@@ -392,7 +392,7 @@ class Bucket(object):
             self._num_requests += 1
 
             try:
-                if self._timeout:
+                if self._timeout is not None:
                     with aiohttp.Timeout(self._timeout):
                         response = yield from self._session.request(req.method, req.url, params=req.params, headers=req.headers, data=req.body)
                 else:
