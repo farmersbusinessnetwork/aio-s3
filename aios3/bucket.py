@@ -397,8 +397,8 @@ class Bucket(object):
                         response = yield from self._session.request(req.method, req.url, params=req.params, headers=req.headers, data=req.body)
                 else:
                     response = yield from self._session.request(req.method, req.url, params=req.params, headers=req.headers, data=req.body)
-
-                response_elapsed = time.time() - start
+            except (KeyboardInterrupt, SystemExit, MemoryError):
+                raise
             except:
                 # yes, we get multiple types of exceptions
                 retries += 1
@@ -407,6 +407,8 @@ class Bucket(object):
                     raise
 
                 continue
+
+            response_elapsed = time.time() - start
 
             if response != 204:
                 try:
