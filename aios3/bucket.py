@@ -62,8 +62,7 @@ class MultipartUpload(object):
         self._done = False
         self._uri = '/' + self.key + '?uploadId=' + self.upload_id
 
-    @asyncio.coroutine
-    def add_chunk(self, data, part_num=None):
+    async def add_chunk(self, data, part_num=None):
         assert isinstance(data, (bytes, memoryview, bytearray, ObjectChunk)), data
 
         # figure out how to check chunk size, all but last one
@@ -85,16 +84,16 @@ class MultipartUpload(object):
 
         is_copy = False
         if isinstance(data, ObjectChunk):
-            objChunk = data
+            obj_chunk = data
             data = b''
-            srcPath = "/{0}/{1}".format(objChunk.bucket, amz_uriencode(objChunk.key))
-            if objChunk.versionId is not None:
-                srcPath = srcPath + "?versionId={0}".format(objChunk.versionId)
+            srcPath = "/{0}/{1}".format(obj_chunk.bucket, amz_uriencode(obj_chunk.key))
+            if obj_chunk.versionId is not None:
+                srcPath = srcPath + "?versionId={0}".format(obj_chunk.versionId)
             headers['x-amz-copy-source'] = srcPath
-            headers['x-amz-copy-source-range'] = "bytes={0}-{1}".format(objChunk.firstByte, objChunk.lastByte)
+            headers['x-amz-copy-source-range'] = "bytes={0}-{1}".format(obj_chunk.firstByte, obj_chunk.lastByte)
             is_copy = True
 
-        response, xml = yield from self.bucket._request("PUT", '/' + self.key, {
+        response, xml = await self.bucket._request("PUT", '/' + self.key, {
                 'uploadId': self.upload_id,
                 'partNumber': str(part_num),
             }, headers=headers, payload=data)
@@ -108,9 +107,8 @@ class MultipartUpload(object):
             if etag.startswith("\""): etag = etag[1:-1]
 
         self.parts[part_num] = etag
-        
-    @asyncio.coroutine
-    def commit(self):
+
+    async def commit(self):
         if self._done:
             raise RuntimeError("Can't commit twice or after close")
         self._done = True
@@ -122,27 +120,25 @@ class MultipartUpload(object):
 
         data = xmltodict.unparse(xml, full_document=False).encode('utf8')
 
-        response, xml = yield from self.bucket._request("POST", '/' + self.key, {
+        response, xml = await self.bucket._request("POST", '/' + self.key, {
                 'uploadId': self.upload_id,
             }, headers={'CONTENT-TYPE': 'application/xml'}, payload=data)
 
         xml = xmltodict.parse(xml)['CompleteMultipartUploadResult']
         return xml
 
-    @asyncio.coroutine
-    def close(self):
+    async def close(self):
         if self._done:
             return
 
         self._done = True
 
-        yield from self.bucket._request("DELETE", '/' + self.key, {'uploadId': self.upload_id})
+        await self.bucket._request("DELETE", '/' + self.key, {'uploadId': self.upload_id})
 
 
 class Bucket(object):
     def __init__(self, name, *,
-                 aws_key=None, aws_secret=None,
-                 aws_region='us-east-1',
+                 aws_region='us-west-2',
                  connector=None,
                  scheme='http',
                  boto_creds=None,
@@ -153,8 +149,6 @@ class Bucket(object):
         Bucket class used to access S3 buckets
 
         @param name: name of bucket to
-        @param aws_key: AWS key to use for authentication
-        @param aws_secret: AWS secret to use for authentication
         @param aws_region: AWS region to use for communication
         @param connector:
         @param scheme: http or https
@@ -165,22 +159,8 @@ class Bucket(object):
         @return: aios3 Bucket object
         """
 
-        if (aws_key is None or aws_secret is None) and boto_creds is None:
-            raise Exception('You must specify aws_key/aws_secret or boto_creds')
+        if logger is None: logger = logging.getLogger('aio-s3')
 
-        if logger is None: logger = logging.logger('aio-s3')
-
-        # TODO: should deprecate aws_key/aws_secret
-        if boto_creds is None:
-            class Creds:
-                def __init__(self):
-                    self.secret_key = aws_secret
-                    self.access_key = aws_key
-                    self.token = None
-
-            boto_creds = Creds()
-
-        self._logger = logger
         self._name = name
         self._connector = connector
         self._num_retries = num_retries
@@ -188,6 +168,7 @@ class Bucket(object):
         self._aws_region = aws_region
         self._boto_creds = boto_creds
         self._timeout = timeout
+        self._logger = logger
 
         # Virtual style host URL
         # ----------------------
@@ -215,9 +196,8 @@ class Bucket(object):
     def __del__(self):
         self._session.close()  # why is this not implicit?
 
-    @asyncio.coroutine
-    def getLocation(self):
-        response, data = yield from self._request("GET", "/", params={'location': ''})
+    async def getLocation(self):
+        response, data = await self._request("GET", "/", params={'location': ''})
 
         region = xmltodict.parse(data)['LocationConstraint']
         if (region is None) or (len(region) == 0):
@@ -225,16 +205,14 @@ class Bucket(object):
 
         return region
 
-    @asyncio.coroutine
-    def exists(self, prefix=''):
-        response, data = yield from self._request("GET", "/", {'prefix': prefix, 'separator': '/', 'max-keys': '1'})
+    async def exists(self, prefix=''):
+        response, data = await self._request("GET", "/", {'prefix': prefix, 'separator': '/', 'max-keys': '1'})
 
         x = xmltodict.parse(data)['ListBucketResult']
         return any(map(Key.from_dict, x["Contents"]))
 
-    @asyncio.coroutine
-    def list(self, prefix='', max_keys=1000):
-        response, data = yield from self._request("GET", "/", {'prefix': prefix, 'max-keys': str(max_keys)})
+    async def list(self, prefix='', max_keys=1000):
+        response, data = await self._request("GET", "/", {'prefix': prefix, 'max-keys': str(max_keys)})
 
         x = xmltodict.parse(data)['ListBucketResult']
 
@@ -247,11 +225,10 @@ class Bucket(object):
         final = False
         marker = ''
 
-        @asyncio.coroutine
-        def read_next():
+        async def read_next():
             nonlocal final, marker
 
-            response, data = yield from self._request( "GET", "/",
+            response, data = await self._request( "GET", "/",
                 {'prefix': prefix,
                  'max-keys': str(max_keys),
                  'marker': marker},
@@ -274,13 +251,12 @@ class Bucket(object):
         while not final:
             yield read_next()
 
-    @asyncio.coroutine
-    def head(self, key, versionId=None):
+    async def head(self, key, versionId=None):
         if isinstance(key, Key):
             key = key.key
 
         params = {} if versionId is None else {'versionId': versionId}
-        response, xml = yield from self._request("HEAD", '/' + key, params)
+        response, xml = await self._request("HEAD", '/' + key, params)
 
         obj = {'Metadata': dict()}
         for h, v in response.headers.items():
@@ -289,23 +265,20 @@ class Bucket(object):
 
         return obj
 
-    @asyncio.coroutine
-    def download(self, key, versionId=None):
+    async def download(self, key, versionId=None):
         if isinstance(key, Key):
             key = key.key
 
         params = {} if versionId is None else {'versionId' : versionId}
-        response, data = yield from self._request( "GET", '/' + key, params)
+        response, data = await self._request("GET", '/' + key, params)
 
         return response
 
-    @asyncio.coroutine
-    def upload_file(self, key, file_path):
+    async def upload_file(self, key, file_path):
         data = open(file_path, 'rb').read()
-        yield from self.upload(key, data, len(data))
+        await self.upload(key, data, len(data))
 
-    @asyncio.coroutine
-    def upload(self, key, data, content_length=None, content_type='application/octed-stream'):
+    async def upload(self, key, data, content_length=None, content_type='application/octed-stream'):
         """Upload file to S3
 
         The `data` might be a generator or stream.
@@ -326,38 +299,34 @@ class Bucket(object):
         if content_length is not None:
             headers['CONTENT-LENGTH'] = str(content_length)
 
-        response, xml = yield from self._request("PUT", '/' + key, {},  headers=headers, payload=data)
+        response, xml = await self._request("PUT", '/' + key, {},  headers=headers, payload=data)
 
         return response
 
-    @asyncio.coroutine
-    def delete(self, key):
+    async def delete(self, key):
         if isinstance(key, Key):
             key = key.key
 
-        response, xml = yield from self._request("DELETE", '/' + key)
+        response, xml = await self._request("DELETE", '/' + key)
 
         return response
 
-    @asyncio.coroutine
-    def copy(self, copy_source, key):
+    async def copy(self, copy_source, key):
         if isinstance(key, Key):
             key = key.key
 
-        response, xml = yield from self._request("PUT", '/' + key, {}, {'x-amz-copy-source': copy_source})
+        response, xml = await self._request("PUT", '/' + key, {}, {'x-amz-copy-source': copy_source})
 
         return xmltodict.parse(xml)["CopyObjectResult"]
 
-    @asyncio.coroutine
-    def get(self, key):
+    async def get(self, key):
         if isinstance(key, Key):
             key = key.key
 
-        response, xml = yield from self._request("GET", '/' + key)
+        response, xml = await self._request("GET", '/' + key)
         return xml
 
-    @asyncio.coroutine
-    def _request(self, method, resource, params=None, headers=None, payload=b''):
+    async def _request(self, method, resource, params=None, headers=None, payload=b''):
         if params is None: params = dict()
         if headers is None: headers = dict()
 
@@ -394,9 +363,13 @@ class Bucket(object):
             try:
                 if self._timeout is not None:
                     with aiohttp.Timeout(self._timeout):
-                        response = yield from self._session.request(req.method, req.url, params=req.params, headers=req.headers, data=req.body)
+                        async with self._session.request(req.method, req.url, params=req.params, headers=req.headers, data=req.body) as response:
+                            if response != 204:
+                                data = await response.read()
                 else:
-                    response = yield from self._session.request(req.method, req.url, params=req.params, headers=req.headers, data=req.body)
+                    async with self._session.request(req.method, req.url, params=req.params, headers=req.headers, data=req.body) as response:
+                        if response != 204:
+                            data = await response.read()
             except (KeyboardInterrupt, SystemExit, MemoryError):
                 raise
             except:
@@ -405,20 +378,7 @@ class Bucket(object):
                 self._logger.warning('Retrying {}/{} on s3 request: {}'.format(retries, self._num_retries, url))
                 if retries == self._num_retries:
                     raise
-
                 continue
-
-            response_elapsed = time.time() - start
-
-            if response != 204:
-                try:
-                    data = yield from response.read()
-                except:
-                    yield from response.wait_for_close()
-
-            read_elapsed = time.time() - start - response_elapsed
-            yield from response.wait_for_close()
-            close_elapsed = time.time() - start - read_elapsed
 
             if response.status == 500:
                 # per AWS docs you should retry a few times after receiving a 500
@@ -426,7 +386,7 @@ class Bucket(object):
                 self._logger.warning("Retrying {}/{} error:{}".format(
                     retries, self._num_retries,errors.AWSException.from_bytes(response.status, data, url)))
 
-                yield from asyncio.sleep(0.5)
+                await asyncio.sleep(0.5)
                 continue
 
             break
@@ -436,8 +396,7 @@ class Bucket(object):
 
         return response, data
 
-    @asyncio.coroutine
-    def upload_multipart(self, key,
+    async def upload_multipart(self, key,
             content_type='application/octed-stream',
             MultipartUpload=MultipartUpload,
             metadata={}):
@@ -450,7 +409,7 @@ class Bucket(object):
         for n, v in metadata.items():
             headers["x-amz-meta-" + n] = v
 
-        response, xml = yield from self._request("POST", '/' + key, params={'uploads': ''}, headers=headers)
+        response, xml = await self._request("POST", '/' + key, params={'uploads': ''}, headers=headers)
 
         xml = xmltodict.parse(xml)['InitiateMultipartUploadResult']
         upload_id = xml['UploadId']
@@ -458,23 +417,21 @@ class Bucket(object):
         assert upload_id
         return MultipartUpload(self, key, upload_id)
 
-    @asyncio.coroutine
-    def abort_multipart_upload(self, key, upload_id):
+    async def abort_multipart_upload(self, key, upload_id):
         if isinstance(key, Key):
             key = key.key
 
-        yield from self._request("DELETE", '/' + key, {"uploadId": upload_id})
+        await self._request("DELETE", '/' + key, {"uploadId": upload_id})
 
     def list_multipart_uploads_by_chunks(self, prefix='', max_uploads=1000):
         final = False
         key_marker = ''
         upload_id_marker = ''
 
-        @asyncio.coroutine
-        def read_next():
+        async def read_next():
             nonlocal final, key_marker, upload_id_marker
 
-            query = {'max-uploads': str(max_uploads), 'uploads':''}
+            query = {'max-uploads': str(max_uploads), 'uploads': ''}
             if len(prefix):
                 query['prefix'] = prefix
 
@@ -482,7 +439,7 @@ class Bucket(object):
                 query['key-marker'] = key_marker
                 query['upload-id-market'] = upload_id_marker
 
-            response, data = yield from self._request("GET", "/", query)
+            response, data = await self._request("GET", "/", query)
 
             x = xmltodict.parse(data)['ListMultipartUploadsResult']
             if 'Upload' not in x: x['Upload'] = []
