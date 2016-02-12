@@ -211,8 +211,16 @@ class Bucket(object):
         x = xmltodict.parse(data)['ListBucketResult']
         return any(map(Key.from_dict, x["Contents"]))
 
-    async def list(self, prefix='', max_keys=1000):
-        response, data = await self._request("GET", "/", {'prefix': prefix, 'max-keys': str(max_keys)})
+    async def list(self, prefix='', delimiter=None, max_keys=1000):
+        params = {
+            'prefix': prefix,
+            'max-keys': str(max_keys)
+        }
+
+        if delimiter:
+            params['delimiter'] = delimiter
+
+        response, data = await self._request("GET", "/", params)
 
         x = xmltodict.parse(data)['ListBucketResult']
 
@@ -221,35 +229,54 @@ class Bucket(object):
 
         return list(map(Key.from_dict, _safe_list(x["Contents"])))
 
-    def list_by_chunks(self, prefix='', max_keys=1000):
-        final = False
-        marker = ''
+    def list_by_chunks(self, prefix='', delimiter=None, boto_style=False, max_keys=1000):
+        class Pager:
+            def __init__(self, bucket: Bucket, prefix='', delimiter=None, boto_style=False, max_keys=1000):
+                self.bucket = bucket
+                self.final = False
+                self.marker = ''
+                self.prefix = prefix
+                self.delimiter = delimiter
+                self.boto_style = boto_style
+                self.max_keys = max_keys
 
-        async def read_next():
-            nonlocal final, marker
+            async def __aiter__(self):
+                return self
 
-            response, data = await self._request( "GET", "/",
-                {'prefix': prefix,
-                 'max-keys': str(max_keys),
-                 'marker': marker},
-            )
+            async def __anext__(self):
+                if self.final: raise StopAsyncIteration
 
-            x = xmltodict.parse(data)['ListBucketResult']
+                params = {
+                    'prefix': self.prefix,
+                    'max-keys': str(max_keys),
+                    'marker': self.marker
+                }
 
-            result = list(map(Key.from_dict, _safe_list(x['Contents']))) if "Contents" in x else []
+                if delimiter:
+                    params['delimiter'] = delimiter
 
-            if x['IsTruncated'] == 'false' or len(result) == 0:
-                final = True
-            else:
-                if 'NextMarker' not in x:  # amazon, really?
-                    marker = result[-1].key
+                response, data = await self.bucket._request("GET", "/", params)
+
+                x = xmltodict.parse(data)['ListBucketResult']
+
+                if self.boto_style:
+                    if 'Contents' in x and not isinstance(x['Contents'], list):
+                        del x['Contents']
+                    result = x
                 else:
-                    marker = x['NextMarker']
+                    result = list(map(Key.from_dict, _safe_list(x['Contents']))) if "Contents" in x else []
 
-            return result
+                if x['IsTruncated'] == 'false' or len(result) == 0:
+                    self.final = True
+                else:
+                    if 'NextMarker' not in x:  # amazon, really?
+                        self.marker = result[-1].key
+                    else:
+                        self.marker = x['NextMarker']
 
-        while not final:
-            yield read_next()
+                return x
+
+        return Pager(self, prefix, delimiter, boto_style, max_keys)
 
     async def head(self, key, versionId=None):
         if isinstance(key, Key):
