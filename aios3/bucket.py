@@ -5,13 +5,16 @@ import xmltodict
 import collections
 import time
 import botocore.auth
-
+import botocore.session
+import botocore.client
 from functools import partial
 from urllib.parse import quote
-
 import aiohttp
 
 from . import errors
+
+# NOTE: if we ever enable this we'll need to support checking for signature expiration
+PRESIGN_SUPPORT = False
 
 amz_uriencode = partial(quote, safe='~')
 
@@ -22,7 +25,8 @@ def _safe_list(obj):
     return obj
 
 
-class Key(object):
+# TODO: get rid of this Key to match botocore
+class Key:
     def __init__(self, *, key, last_modified, etag, size, storage_class):
         self.key = key
         self.last_modified = last_modified
@@ -136,7 +140,32 @@ class MultipartUpload(object):
         await self.bucket._request("DELETE", '/' + self.key, {'uploadId': self.upload_id})
 
 
-class Bucket(object):
+# TODO get rid of idea of Bucket class and instead have a session that does NOT know the bucket
+# to match botocore
+# TODO have a generic pager, or re-use the botocore pager
+# TODO have a cython signature class to reduce CPU usage (http://docs.aws.amazon.com/general/latest/gr/sigv4-signed-request-examples.html)
+class Bucket:
+    class StatsUpdater:
+        def __init__(self, bucket):
+            self._bucket = bucket
+
+        def __enter__(self):
+            self._bucket._concurrent += 1
+            self.start = time.time()
+            return self
+
+        def __exit__(self, exc_type, exc, exc_tb):
+            now = time.time()
+            self.elapsed = now - self.start
+            self._bucket._concurrent -= 1
+            self._bucket._request_times.append(self.elapsed)
+
+            if (now - self._bucket._last_stat_time) > 5:
+                self._bucket._last_stat_time = now
+
+                self._bucket._logger.info("aios3 concurrency:{} lag min:{} avg:{} max:{} num:{}".format(self._bucket._concurrent, min(self._bucket._request_times), sum(self._bucket._request_times) / len(self._bucket._request_times), max(self._bucket._request_times), len(self._bucket._request_times)))
+                self._bucket._request_times.clear()
+
     def __init__(self, name, *,
                  aws_region='us-west-2',
                  connector=None,
@@ -144,7 +173,8 @@ class Bucket(object):
                  boto_creds=None,
                  logger=None,
                  num_retries=5,
-                 timeout=None):
+                 timeout=None,
+                 loop=None):
         """
         Bucket class used to access S3 buckets
 
@@ -169,6 +199,10 @@ class Bucket(object):
         self._boto_creds = boto_creds
         self._timeout = timeout
         self._logger = logger
+        self._loop = loop
+        self._presign_cache = dict()  # (method, params) -> url
+        self._cache_hits = 0
+        self._cache_misses = 0
 
         # Virtual style host URL
         # ----------------------
@@ -189,9 +223,21 @@ class Bucket(object):
         self._endpoint = self._host + "/" + self._name
 
         if self._connector is None:
-            self._connector = aiohttp.TCPConnector(force_close=False, keepalive_timeout=10, use_dns_cache=True)
+            self._connector = aiohttp.TCPConnector(force_close=False, keepalive_timeout=10, use_dns_cache=False, loop=self._loop)
 
-        self._session = aiohttp.ClientSession(connector=self._connector)
+        self._session = aiohttp.ClientSession(connector=self._connector, loop=self._loop)
+        self._signer = botocore.auth.S3SigV4Auth(self._boto_creds, 's3', self._aws_region)
+
+        if PRESIGN_SUPPORT:
+            boto_session = botocore.session.get_session()
+            config = botocore.client.Config(signature_version='s3v4')
+            use_ssl = self._scheme == 'https'
+            self._boto_client = boto_session.create_client('s3', region_name=aws_region, use_ssl=use_ssl, config=config)
+
+        # stats support
+        self._concurrent = 0
+        self._last_stat_time = time.time()
+        self._request_times = []
 
     def __del__(self):
         self._session.close()  # why is this not implicit?
@@ -240,16 +286,21 @@ class Bucket(object):
                 self.boto_style = boto_style
                 self.max_keys = max_keys
 
+            async def __anext__(self):
+                if self.final: raise StopAsyncIteration
+                return await self.next_page()
+
             async def __aiter__(self):
                 return self
 
-            async def __anext__(self):
-                if self.final: raise StopAsyncIteration
+            async def next_page(self):
+                if self.final: return None
 
                 params = {
                     'prefix': self.prefix,
                     'max-keys': str(max_keys),
-                    'marker': self.marker
+                    'marker': self.marker,
+                    'encoding-type': 'url'
                 }
 
                 if delimiter:
@@ -261,7 +312,11 @@ class Bucket(object):
 
                 if self.boto_style:
                     if 'Contents' in x and not isinstance(x['Contents'], list):
-                        del x['Contents']
+                        x['Contents'] = [x['Contents']]
+
+                    if 'CommonPrefixes' in x and not isinstance(x['CommonPrefixes'], list):
+                        x['CommonPrefixes'] = [x['CommonPrefixes']]
+
                     result = x
                 else:
                     result = list(map(Key.from_dict, _safe_list(x['Contents']))) if "Contents" in x else []
@@ -270,7 +325,10 @@ class Bucket(object):
                     self.final = True
                 else:
                     if 'NextMarker' not in x:  # amazon, really?
-                        self.marker = result[-1].key
+                        if self.boto_style:
+                            self.marker = result['Contents'][-1]['Key']
+                        else:
+                            self.marker = result[-1].key
                     else:
                         self.marker = x['NextMarker']
 
@@ -328,15 +386,14 @@ class Bucket(object):
 
         response, xml = await self._request("PUT", '/' + key, {},  headers=headers, payload=data)
 
-        return response
+        return xml, dict(response.headers)
 
     async def delete(self, key):
         if isinstance(key, Key):
             key = key.key
-
         response, xml = await self._request("DELETE", '/' + key)
 
-        return response
+        return xml
 
     async def copy(self, copy_source, key):
         if isinstance(key, Key):
@@ -350,30 +407,44 @@ class Bucket(object):
         if isinstance(key, Key):
             key = key.key
 
-        response, xml = await self._request("GET", '/' + key)
-        return xml
+        if PRESIGN_SUPPORT:
+            pre_key = ('get_object', {'Bucket': self._name, 'Key': key})
+            try:
+                ps_url = self._presign_cache[key]
+                self._cache_hits += 1
+            except:
+                self._cache_misses += 1
+                ps_url = self._boto_client.generate_presigned_url(pre_key[0], Params=pre_key[1])
+                self._presign_cache[key] = ps_url
 
-    async def _request(self, method, resource, params=None, headers=None, payload=b''):
-        if params is None: params = dict()
-        if headers is None: headers = dict()
+            response, data = await self._request("GET", None, presigned_url=ps_url)
+        else:
+            response, data = await self._request("GET", '/' + key)
 
-        headers['HOST'] = self._host
-        headers['CONTENT-LENGTH'] = str(len(payload))
+        return data, dict(response.headers)
 
-        url = '{}://{}{}'.format(self._scheme, self._endpoint, resource)
+    async def _request(self, method, resource, params=None, headers=None, payload=b'', presigned_url=None):
+        if presigned_url:
+            url = presigned_url
+        else:
+            url = '{}://{}{}'.format(self._scheme, self._endpoint, resource)
+
+            if headers is None: headers = dict()
+
+            headers['host'] = self._host
+            headers['CONTENT-LENGTH'] = str(len(payload)) if payload else '0'
 
         class S3Request:
-            def __init__(self):
-                self.headers = headers
-                self.params = params
+            def __init__(self, in_headers, in_params, in_body, in_method, in_url):
+                self.headers = in_headers
+                self.params = in_params if in_params else dict()
                 self.context = dict()
-                self.body = payload
-                self.method = method
-                self.url = url
+                self.body = in_body
+                self.method = in_method
+                self.url = in_url
 
-        signer = botocore.auth.S3SigV4Auth(self._boto_creds, 's3', self._aws_region)
-        req = S3Request()
-        signer.add_auth(req)
+            def __str__(self):
+                return "method:{} url:{} headers:{} params:{}".format(self.method, self.url, self.headers, self.params)
 
         response = lambda: None
         response.status = 500
@@ -382,41 +453,43 @@ class Bucket(object):
 
         # Note: from what I gather these errors are to be expected all the time
         #       either that or there are several connection issues in aiohttp
-        #       from what I gather we usually never have to go beyond one retry
-        while retries < self._num_retries:
-            start = time.time()
-            self._num_requests += 1
+        #       also from what I've seen we usually never have to go beyond one retry
+        with Bucket.StatsUpdater(self) as su:
+            while retries < self._num_retries:
+                self._num_requests += 1
+                if not presigned_url:
+                    req = S3Request(headers, params, payload, method, url)
+                    self._signer.add_auth(req)
 
-            try:
-                if self._timeout is not None:
-                    with aiohttp.Timeout(self._timeout):
+                try:
+                    if self._timeout is not None:
+                        with aiohttp.Timeout(self._timeout):
+                            async with self._session.request(req.method, req.url, params=req.params, headers=req.headers, data=req.body) as response:
+                                async with response:
+                                    data = await response.read()
+                    else:
                         async with self._session.request(req.method, req.url, params=req.params, headers=req.headers, data=req.body) as response:
-                            if response != 204:
-                                data = await response.read()
-                else:
-                    async with self._session.request(req.method, req.url, params=req.params, headers=req.headers, data=req.body) as response:
-                        if response != 204:
-                            data = await response.read()
-            except (KeyboardInterrupt, SystemExit, MemoryError):
-                raise
-            except:
-                # yes, we get multiple types of exceptions
-                retries += 1
-                self._logger.warning('Retrying {}/{} on s3 request: {}'.format(retries, self._num_retries, url))
-                if retries == self._num_retries:
+                            async with response:
+                                if response != 204:
+                                    data = await response.read()
+                except (KeyboardInterrupt, SystemExit, MemoryError):
                     raise
-                continue
+                except:
+                    retries += 1
+                    self._logger.info('Retrying {}/{} request:{}'.format(retries, self._num_retries, req))
+                    if retries == self._num_retries:
+                        raise
+                    continue
 
-            if response.status == 500:
-                # per AWS docs you should retry a few times after receiving a 500
-                retries += 1
-                self._logger.warning("Retrying {}/{} error:{}".format(
-                    retries, self._num_retries,errors.AWSException.from_bytes(response.status, data, url)))
+                if response.status == 500:
+                    # per AWS docs you should retry a few times after receiving a 500
+                    retries += 1
+                    self._logger.warning("Retrying {}/{} request:{} error:{}".format(retries, self._num_retries, req, errors.AWSException.from_bytes(response.status, data, url)))
 
-                await asyncio.sleep(0.5)
-                continue
+                    await asyncio.sleep(0.5)
+                    continue
 
-            break
+                break
 
         if response.status not in [200, 204]:
             raise errors.AWSException.from_bytes(response.status, data, url)
