@@ -163,7 +163,10 @@ class Bucket:
             if (now - self._bucket._last_stat_time) > 5:
                 self._bucket._last_stat_time = now
 
-                self._bucket._logger.info("aios3 concurrency:{} lag min:{} avg:{} max:{} num:{}".format(self._bucket._concurrent, min(self._bucket._request_times), sum(self._bucket._request_times) / len(self._bucket._request_times), max(self._bucket._request_times), len(self._bucket._request_times)))
+                min_time = round(min(self._bucket._request_times), 3)
+                max_time = round(max(self._bucket._request_times), 3)
+                avg_time = round(sum(self._bucket._request_times) / len(self._bucket._request_times), 3)
+                self._bucket._logger.info("aios3 concurrency:{} lag min:{} avg:{} max:{} num:{}".format(self._bucket._concurrent, min_time, avg_time, max_time, len(self._bucket._request_times)))
                 self._bucket._request_times.clear()
 
     def __init__(self, name, *,
@@ -450,6 +453,7 @@ class Bucket:
         response.status = 500
         retries = 0
         data = b''
+        next_wait = 0.1
 
         # Note: from what I gather these errors are to be expected all the time
         #       either that or there are several connection issues in aiohttp
@@ -484,9 +488,14 @@ class Bucket:
                 if response.status == 500:
                     # per AWS docs you should retry a few times after receiving a 500
                     retries += 1
-                    self._logger.warning("Retrying {}/{} request:{} error:{}".format(retries, self._num_retries, req, errors.AWSException.from_bytes(response.status, data, url)))
+                    err = errors.AWSException.from_bytes(response.status, data, url)
+                    self._logger.warning("Retrying {}/{} request:{} error:{}".format(retries, self._num_retries, req, err))
 
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(next_wait)
+
+                    if isinstance(err, errors.SlowDown) or isinstance(err, errors.InternalError):
+                        next_wait *= 5  # 0.1->0.5->2.5->12.5->62.5
+
                     continue
 
                 break
