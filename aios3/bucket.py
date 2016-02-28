@@ -260,7 +260,7 @@ class Bucket:
         x = xmltodict.parse(data)['ListBucketResult']
         return any(map(Key.from_dict, x["Contents"]))
 
-    async def list(self, prefix='', delimiter=None, max_keys=1000):
+    async def list(self, prefix='', delimiter=None, max_keys=1000, boto_style=False):
         params = {
             'prefix': prefix,
             'max-keys': str(max_keys)
@@ -276,7 +276,16 @@ class Bucket:
         if x['IsTruncated'] != 'false':
             raise AssertionError("File list is truncated, use bigger max_keys")
 
-        return list(map(Key.from_dict, _safe_list(x["Contents"])))
+        if boto_style:
+            if 'Contents' in x and not isinstance(x['Contents'], list):
+                x['Contents'] = [x['Contents']]
+
+            if 'CommonPrefixes' in x and not isinstance(x['CommonPrefixes'], list):
+                x['CommonPrefixes'] = [x['CommonPrefixes']]
+
+            return x
+        else:
+            return list(map(Key.from_dict, _safe_list(x["Contents"])))
 
     def list_by_chunks(self, prefix='', delimiter=None, boto_style=False, max_keys=1000):
         class Pager:

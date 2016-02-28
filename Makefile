@@ -7,7 +7,7 @@ clean:
 	rm -fr build dist *.egg-info
 
 upload:
-	python setup.py sdist upload -r http://repos.fbn.internal:8080/pypi
+	python setup.py sdist upload -r https://pypi.fbn.internal/simple
 
 develop:
 	python3 install -e .
