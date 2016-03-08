@@ -487,7 +487,7 @@ class Bucket:
                         raise
                     continue
 
-                if response.status == 500:
+                if response.status not in [200, 204]:
                     # per AWS docs you should retry a few times after receiving a 500
                     retries += 1
                     err = errors.AWSException.from_bytes(response.status, data, url)
