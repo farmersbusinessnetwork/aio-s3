@@ -3,6 +3,7 @@ import logging
 import asyncio
 import xmltodict
 import collections
+import dateutil.parser
 import time
 import botocore.auth
 import botocore.session
@@ -26,6 +27,7 @@ def _safe_list(obj):
 
 
 # TODO: get rid of this Key to match botocore
+# TODO: re-write aio-s3 to return the same exceptions as aiobotocore (everything should behave like aiobotocore)
 class Key:
     def __init__(self, *, key, last_modified, etag, size, storage_class):
         self.key = key
@@ -175,7 +177,7 @@ class Bucket:
                  scheme='http',
                  boto_creds=None,
                  logger=None,
-                 num_retries=5,
+                 num_retries=6,
                  timeout=None,
                  loop=None):
         """
@@ -260,11 +262,17 @@ class Bucket:
         x = xmltodict.parse(data)['ListBucketResult']
         return any(map(Key.from_dict, x["Contents"]))
 
-    async def list(self, prefix='', delimiter=None, max_keys=1000, boto_style=False):
+    async def list(self, prefix='', delimiter=None, max_keys=1000, boto_style=False, allow_truncated=False, marker=None):
         params = {
             'prefix': prefix,
-            'max-keys': str(max_keys)
+            'max-keys': str(max_keys),
+
+            # If you need to support extended characters enable this and then url decode the Key
+            # 'encoding-type': 'url'
         }
+
+        if marker:
+            params['marker'] = marker
 
         if delimiter:
             params['delimiter'] = delimiter
@@ -273,12 +281,20 @@ class Bucket:
 
         x = xmltodict.parse(data)['ListBucketResult']
 
-        if x['IsTruncated'] != 'false':
+        if x['IsTruncated'] != 'false' and not allow_truncated:
             raise AssertionError("File list is truncated, use bigger max_keys")
 
         if boto_style:
+            x['IsTruncated'] = x['IsTruncated'] == 'true'
+            x['MaxKeys'] = int(x['MaxKeys'])
+
             if 'Contents' in x and not isinstance(x['Contents'], list):
                 x['Contents'] = [x['Contents']]
+
+            for c in x['Contents']:
+                # Note these pickle to 105 bytes!  Interesting fact is that dateutil is faster than strptime
+                c['LastModified'] = dateutil.parser.parse(c['LastModified'])
+                c['Size'] = int(c['Size'])
 
             if 'CommonPrefixes' in x and not isinstance(x['CommonPrefixes'], list):
                 x['CommonPrefixes'] = [x['CommonPrefixes']]
@@ -308,43 +324,20 @@ class Bucket:
             async def next_page(self):
                 if self.final: return None
 
-                params = {
-                    'prefix': self.prefix,
-                    'max-keys': str(max_keys),
-                    'marker': self.marker,
-                    'encoding-type': 'url'
-                }
+                result = await self.bucket.list(prefix, delimiter, boto_style=True, allow_truncated=True, marker=self.marker)
 
-                if delimiter:
-                    params['delimiter'] = delimiter
-
-                response, data = await self.bucket._request("GET", "/", params)
-
-                x = xmltodict.parse(data)['ListBucketResult']
-
-                if self.boto_style:
-                    if 'Contents' in x and not isinstance(x['Contents'], list):
-                        x['Contents'] = [x['Contents']]
-
-                    if 'CommonPrefixes' in x and not isinstance(x['CommonPrefixes'], list):
-                        x['CommonPrefixes'] = [x['CommonPrefixes']]
-
-                    result = x
-                else:
-                    result = list(map(Key.from_dict, _safe_list(x['Contents']))) if "Contents" in x else []
-
-                if x['IsTruncated'] == 'false' or len(result) == 0:
+                if result['IsTruncated'] == 'false' or len(result) == 0:
                     self.final = True
                 else:
-                    if 'NextMarker' not in x:  # amazon, really?
-                        if self.boto_style:
-                            self.marker = result['Contents'][-1]['Key']
-                        else:
-                            self.marker = result[-1].key
+                    if 'NextMarker' not in result:  # amazon, really?
+                        self.marker = result['Contents'][-1]['Key']
                     else:
-                        self.marker = x['NextMarker']
+                        self.marker = result['NextMarker']
 
-                return x
+                if boto_style:
+                    return result
+                else:
+                    return list(map(Key.from_dict, _safe_list(result["Contents"])))
 
         return Pager(self, prefix, delimiter, boto_style, max_keys)
 
