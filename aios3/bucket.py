@@ -25,6 +25,19 @@ def _safe_list(obj):
         return [obj]
     return obj
 
+_retry_error_types = (
+    errors.ExpiredToken,
+    errors.InternalError,
+    errors.InvalidBucketState,
+    errors.InvalidObjectState,
+    errors.InvalidRequest,
+    errors.OperationAborted,
+    errors.RequestTimeout,
+    errors.RequestTimeTooSkewed,
+    errors.ServiceUnavailable,
+    errors.SlowDown,
+    errors.TokenRefreshRequired,
+)
 
 # TODO: get rid of this Key to match botocore
 # TODO: re-write aio-s3 to return the same exceptions as aiobotocore (everything should behave like aiobotocore)
@@ -288,7 +301,9 @@ class Bucket:
             x['IsTruncated'] = x['IsTruncated'] == 'true'
             x['MaxKeys'] = int(x['MaxKeys'])
 
-            if 'Contents' in x and not isinstance(x['Contents'], list):
+            if 'Contents' not in x:
+                x['Contents'] = []
+            elif not isinstance(x['Contents'], list):
                 x['Contents'] = [x['Contents']]
 
             for c in x['Contents']:
@@ -296,7 +311,9 @@ class Bucket:
                 c['LastModified'] = dateutil.parser.parse(c['LastModified'])
                 c['Size'] = int(c['Size'])
 
-            if 'CommonPrefixes' in x and not isinstance(x['CommonPrefixes'], list):
+            if 'CommonPrefixes' not in x:
+                x['CommonPrefixes'] = []
+            elif not isinstance(x['CommonPrefixes'], list):
                 x['CommonPrefixes'] = [x['CommonPrefixes']]
 
             return x
@@ -488,17 +505,20 @@ class Bucket:
                     continue
 
                 if response.status not in [200, 204]:
-                    # per AWS docs you should retry a few times after receiving a 500
                     retries += 1
                     err = errors.AWSException.from_bytes(response.status, data, url)
-                    self._logger.warning("Retrying {}/{} request:{} error:{}".format(retries, self._num_retries, req, err))
 
-                    await asyncio.sleep(next_wait)
+                    if isinstance(err, _retry_error_types):
+                        self._logger.warning("Retrying {}/{} request:{} error:{}".format(retries, self._num_retries, req, err))
 
-                    if isinstance(err, errors.SlowDown) or isinstance(err, errors.InternalError):
-                        next_wait *= 5  # 0.1->0.5->2.5->12.5->62.5
+                        await asyncio.sleep(next_wait)
 
-                    continue
+                        if isinstance(err, errors.SlowDown) or isinstance(err, errors.InternalError):
+                            next_wait *= 5  # 0.1->0.5->2.5->12.5->62.5
+
+                        continue
+                    else:
+                        raise err
 
                 break
 
