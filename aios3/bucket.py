@@ -11,6 +11,8 @@ import botocore.client
 from functools import partial
 from urllib.parse import quote
 import aiohttp
+import hashlib
+import base64
 
 from . import errors
 
@@ -241,7 +243,11 @@ class Bucket:
         self._endpoint = self._host + "/" + self._name
 
         if self._connector is None:
-            self._connector = aiohttp.TCPConnector(force_close=False, keepalive_timeout=10, use_dns_cache=False, loop=self._loop)
+            kwargs = {}
+            if timeout:
+                kwargs['conn_timeout'] = timeout
+
+            self._connector = aiohttp.TCPConnector(force_close=False, keepalive_timeout=10, use_dns_cache=False, loop=self._loop, **kwargs)
 
         self._session = aiohttp.ClientSession(connector=self._connector, loop=self._loop)
         self._signer = botocore.auth.S3SigV4Auth(self._boto_creds, 's3', self._aws_region)
@@ -417,6 +423,41 @@ class Bucket:
 
         return xml
 
+    # boto style
+    async def delete_objects(self, Delete, MFA=None, RequestPayer=None):
+        assert not RequestPayer
+
+        body_dict = {'Delete': {'Object': []}}
+
+        if 'Quiet' in Delete:
+            body_dict['Delete']['Quiet'] = "true" if Delete['Quiet'] else "false"
+
+        for o in Delete['Objects']:
+            body_dict['Delete']['Object'].append(o)
+
+        body = xmltodict.unparse(body_dict).encode('utf-8')
+
+        md5 = hashlib.md5(body).digest()
+        md5 = base64.b64encode(md5).decode('ISO-8859-1')
+        headers = {'Content-MD5': md5}
+
+        if MFA:
+            headers['x-amz-mfa'] = MFA
+
+        response, xml = await self._request("POST", '/?delete', headers=headers, payload=body)
+        response = xmltodict.parse(xml)['DeleteResult']
+        if 'Deleted' not in response:
+            response['Deleted'] = []
+        elif not isinstance(response['Deleted'], list):
+            response['Deleted'] = [response['Deleted']]
+
+        if 'Error' not in response:
+            response['Error'] = []
+        elif not isinstance(response['Error'], list):
+            response['Error'] = [response['Error']]
+
+        return response
+
     async def copy(self, copy_source, key):
         if isinstance(key, Key):
             key = key.key
@@ -497,9 +538,9 @@ class Bucket:
                                     data = await response.read()
                 except (KeyboardInterrupt, SystemExit, MemoryError):
                     raise
-                except:
+                except Exception as e:
                     retries += 1
-                    self._logger.info('Retrying {}/{} request:{}'.format(retries, self._num_retries, req))
+                    self._logger.info('Retrying {}/{} request:{} exception:{}'.format(retries, self._num_retries, req, e))
                     if retries == self._num_retries:
                         raise
                     continue
