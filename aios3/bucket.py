@@ -284,11 +284,12 @@ class Bucket:
     async def getLocation(self):
         response, data = await self._request("GET", "/", params={'location': ''})
 
-        region = xmltodict.parse(data)['LocationConstraint']
-        if (region is None) or (len(region) == 0):
+        x = xmltodict.parse(data)
+        region = x['LocationConstraint']
+        if ('#text' not in region) or (len(region) == 0):
             return 'us-east-1'
 
-        return region
+        return region['#text']
 
     async def exists(self, prefix=''):
         response, data = await self._request("GET", "/", {'prefix': prefix, 'separator': '/', 'max-keys': '1'})
@@ -619,33 +620,42 @@ class Bucket:
         await self._request("DELETE", '/' + key, {"uploadId": upload_id})
 
     def list_multipart_uploads_by_chunks(self, prefix='', max_uploads=1000):
-        final = False
-        key_marker = ''
-        upload_id_marker = ''
+        class _Pager:
+            def __init__(self, parent: Bucket, prefix, max_uploads):
+                self._parent = parent
+                self._final = False
+                self._key_marker = ''
+                self._upload_id_marker = ''
+                self._prefix = prefix
+                self._max_uploads = max_uploads
 
-        async def read_next():
-            nonlocal final, key_marker, upload_id_marker
+            async def next_page(self):
+                query = {'max-uploads': str(self._max_uploads), 'uploads': ''}
+                if len(self._prefix):
+                    query['prefix'] = self._prefix
 
-            query = {'max-uploads': str(max_uploads), 'uploads': ''}
-            if len(prefix):
-                query['prefix'] = prefix
+                if len(self._key_marker):
+                    query['key-marker'] = self._key_marker
+                    query['upload-id-market'] = self._upload_id_marker
 
-            if len(key_marker):
-                query['key-marker'] = key_marker
-                query['upload-id-market'] = upload_id_marker
+                response, data = await self._parent._request("GET", "/", query)
 
-            response, data = await self._request("GET", "/", query)
+                x = xmltodict.parse(data)['ListMultipartUploadsResult']
+                if 'Upload' not in x: x['Upload'] = []
 
-            x = xmltodict.parse(data)['ListMultipartUploadsResult']
-            if 'Upload' not in x: x['Upload'] = []
+                if x['IsTruncated'] == 'false' or len(x['Upload']) == 0:
+                    self._final = True
+                else:
+                    self._key_marker = x['NextKeyMarker']
+                    self._upload_id_marker = x['NextUploadIdMarker']
 
-            if x['IsTruncated'] == 'false' or len(x['Upload']) == 0:
-                final = True
-            else:
-                key_marker = x['NextKeyMarker']
-                upload_id_marker = x['NextUploadIdMarker']
+                return x
 
-            return x
+            async def __anext__(self):
+                if self._final: raise StopAsyncIteration
+                return await self.next_page()
 
-        while not final:
-            yield read_next()
+            async def __aiter__(self):
+                return self
+
+        return _Pager(self, prefix, max_uploads)
