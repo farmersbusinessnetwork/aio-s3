@@ -40,7 +40,9 @@ _retry_error_types = (
     errors.ServiceUnavailable,
     errors.SlowDown,
     errors.TokenRefreshRequired,
+    RuntimeError
 )
+
 
 # TODO: get rid of this Key to match botocore
 # TODO: re-write aio-s3 to return the same exceptions as aiobotocore (everything should behave like aiobotocore)
