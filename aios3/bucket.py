@@ -477,7 +477,7 @@ class Bucket:
             key = key.key
 
         if uri_encode_source:
-            copy_source = amz_uriencode(copy_source)
+            copy_source = quote(copy_source)
 
         response, xml = await self._request("PUT", '/' + key, {}, {'x-amz-copy-source': copy_source})
 
