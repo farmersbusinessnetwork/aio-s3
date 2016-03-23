@@ -248,7 +248,12 @@ class Bucket:
         # that have '.'s: http://docs.aws.amazon.com/AmazonS3/latest/dev/BucketRestrictions.html
 
         self._scheme = scheme
-        self._host = "s3-" + aws_region + ".amazonaws.com"
+
+        if aws_region == 'us-east-1':
+            self._host = "s3.amazonaws.com"
+        else:
+            self._host = "s3-" + aws_region + ".amazonaws.com"
+
         self._endpoint = self._host + "/" + self._name
 
         if self._boto_creds is None:
