@@ -550,6 +550,10 @@ class Bucket:
                             async with self._session.request(req.method, req.url, params=req.params, headers=req.headers, data=req.body) as response:
                                 async with response:
                                     data = await response.read()
+
+                        if response.status not in [200, 204]:
+                            # this can raise a RuntimeError
+                            errors.AWSException.from_bytes(response.status, data, url)
                     else:
                         async with self._session.request(req.method, req.url, params=req.params, headers=req.headers, data=req.body) as response:
                             async with response:
