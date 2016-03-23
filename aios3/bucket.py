@@ -458,9 +458,13 @@ class Bucket:
 
         return response
 
-    async def copy(self, copy_source, key):
+    # encode_uri is for old users of this API
+    async def copy(self, copy_source, key, uri_encode_source=False):
         if isinstance(key, Key):
             key = key.key
+
+        if uri_encode_source:
+            copy_source = amz_uriencode(copy_source)
 
         response, xml = await self._request("PUT", '/' + key, {}, {'x-amz-copy-source': copy_source})
 
@@ -518,7 +522,7 @@ class Bucket:
         # Note: from what I gather these errors are to be expected all the time
         #       either that or there are several connection issues in aiohttp
         #       also from what I've seen we usually never have to go beyond one retry
-        with Bucket.StatsUpdater(self) as su:
+        with Bucket.StatsUpdater(self):
             while retries < self._num_retries:
                 self._num_requests += 1
                 if not presigned_url:
