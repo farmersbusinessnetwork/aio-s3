@@ -8,6 +8,7 @@ import time
 import botocore.auth
 import botocore.session
 import botocore.client
+import botocore.credentials
 from functools import partial
 from urllib.parse import quote
 import aiohttp
@@ -53,8 +54,13 @@ class Key:
 
     @classmethod
     def from_dict(Key, d):
+        last_modified = d['LastModified']
+
+        if not isinstance(last_modified, datetime.datetime):
+            last_modified = dateutil.parser.parse(last_modified)
+
         return Key(
-            key=d['Key'], last_modified=datetime.datetime.strptime(d['LastModified'], '%Y-%m-%dT%H:%M:%S.000Z'),
+            key=d['Key'], last_modified=last_modified,
             etag=d['ETag'], size=d['Size'], storage_class=d['StorageClass']
         )
 
@@ -217,6 +223,7 @@ class Bucket:
         self._num_requests = 0
         self._aws_region = aws_region
         self._boto_creds = boto_creds
+        self._boto_session = None
         self._timeout = timeout
         self._logger = logger
         self._loop = loop
@@ -242,6 +249,10 @@ class Bucket:
         self._host = "s3-" + aws_region + ".amazonaws.com"
         self._endpoint = self._host + "/" + self._name
 
+        if self._boto_creds is None:
+            self._boto_session = botocore.session.get_session()
+            self._boto_creds = botocore.credentials.create_credential_resolver(self._boto_session).load_credentials()
+
         if self._connector is None:
             kwargs = {}
             if timeout:
@@ -253,10 +264,12 @@ class Bucket:
         self._signer = botocore.auth.S3SigV4Auth(self._boto_creds, 's3', self._aws_region)
 
         if PRESIGN_SUPPORT:
-            boto_session = botocore.session.get_session()
+            if self._boto_session is None:
+                self._boto_session = botocore.session.get_session()
+
             config = botocore.client.Config(signature_version='s3v4')
             use_ssl = self._scheme == 'https'
-            self._boto_client = boto_session.create_client('s3', region_name=aws_region, use_ssl=use_ssl, config=config)
+            self._boto_client = self._boto_session.create_client('s3', region_name=aws_region, use_ssl=use_ssl, config=config)
 
         # stats support
         self._concurrent = 0
@@ -349,7 +362,7 @@ class Bucket:
 
                 result = await self.bucket.list(prefix, delimiter, boto_style=True, allow_truncated=True, marker=self.marker)
 
-                if result['IsTruncated'] == 'false' or len(result) == 0:
+                if not result['IsTruncated']:
                     self.final = True
                 else:
                     if 'NextMarker' not in result:  # amazon, really?
@@ -357,7 +370,7 @@ class Bucket:
                     else:
                         self.marker = result['NextMarker']
 
-                if boto_style:
+                if self.boto_style:
                     return result
                 else:
                     return list(map(Key.from_dict, _safe_list(result["Contents"])))
