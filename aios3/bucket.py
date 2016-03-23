@@ -433,13 +433,14 @@ class Bucket:
         if content_length is not None:
             headers['CONTENT-LENGTH'] = str(content_length)
 
-        response, xml = await self._request("PUT", '/' + key, {},  headers=headers, payload=data)
+        response, xml = await self._request("PUT", '/' + key, headers=headers, payload=data)
 
         return xml, dict(response.headers)
 
     async def delete(self, key):
         if isinstance(key, Key):
             key = key.key
+
         response, xml = await self._request("DELETE", '/' + key)
 
         return xml
@@ -480,12 +481,9 @@ class Bucket:
         return response
 
     # encode_uri is for old users of this API
-    async def copy(self, copy_source, key, uri_encode_source=False):
+    async def copy(self, copy_source, key):
         if isinstance(key, Key):
             key = key.key
-
-        if uri_encode_source:
-            copy_source = quote(copy_source)
 
         response, xml = await self._request("PUT", '/' + key, {}, {'x-amz-copy-source': copy_source})
 
@@ -512,6 +510,9 @@ class Bucket:
         return data, dict(response.headers)
 
     async def _request(self, method, resource, params=None, headers=None, payload=b'', presigned_url=None):
+        # we need to pre-encode the url because the signature needs to match the final url
+        resource = quote(resource)
+
         if presigned_url:
             url = presigned_url
         else:
