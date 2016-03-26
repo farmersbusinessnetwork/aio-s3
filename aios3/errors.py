@@ -1,6 +1,7 @@
 from xml.etree.ElementTree import ParseError
 import xmltodict
 
+
 class AWSException(Exception):
     """Base for exceptions returned by amazon"""
 

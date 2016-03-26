@@ -552,20 +552,13 @@ class Bucket:
                     self._signer.add_auth(req)
 
                 try:
-                    if self._timeout is not None:
-                        with aiohttp.Timeout(self._timeout):
-                            async with self._session.request(req.method, req.url, params=req.params, headers=req.headers, data=req.body) as response:
-                                async with response:
-                                    data = await response.read()
+                    async with (await asyncio.wait_for(self._session.request(req.method, req.url, params=req.params, headers=req.headers, data=req.body),
+                                                       self._timeout, loop=self._loop)) as response:
+                        data = await response.read()
 
-                        if response.status not in [200, 204]:
-                            # this can raise a RuntimeError
-                            errors.AWSException.from_bytes(response.status, data, url)
-                    else:
-                        async with self._session.request(req.method, req.url, params=req.params, headers=req.headers, data=req.body) as response:
-                            async with response:
-                                if response != 204:
-                                    data = await response.read()
+                    if response.status not in [200, 204]:
+                        # this can raise a RuntimeError
+                        errors.AWSException.from_bytes(response.status, data, url)
                 except (KeyboardInterrupt, SystemExit, MemoryError):
                     raise
                 except Exception as e:
