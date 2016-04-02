@@ -559,7 +559,7 @@ class Bucket:
                     if response.status not in [200, 204]:
                         # this can raise a RuntimeError
                         errors.AWSException.from_bytes(response.status, data, url)
-                except (KeyboardInterrupt, SystemExit, MemoryError):
+                except (KeyboardInterrupt, SystemExit, MemoryError, asyncio.CancelledError):
                     raise
                 except Exception as e:
                     retries += 1
