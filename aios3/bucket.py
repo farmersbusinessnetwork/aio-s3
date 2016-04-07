@@ -489,7 +489,6 @@ class Bucket:
         response = await self._request("POST", '/?delete', 'DeleteObjects', headers=headers, payload=body)
         return response
 
-    # encode_uri is for old users of this API
     async def copy(self, copy_source, key):
         if isinstance(key, Key):
             key = key.key
