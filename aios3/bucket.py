@@ -486,7 +486,8 @@ class Bucket:
         if MFA:
             headers['x-amz-mfa'] = MFA
 
-        response = await self._request("POST", '/?delete', 'DeleteObjects', headers=headers, payload=body)
+        params = {'delete': ''}
+        response = await self._request("POST", '/', 'DeleteObjects', params=params, headers=headers, payload=body)
         return response
 
     async def copy(self, copy_source, key):
