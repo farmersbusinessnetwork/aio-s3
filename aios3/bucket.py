@@ -320,6 +320,10 @@ class Bucket:
         self._last_stat_time = time.time()
         self._request_times = []
 
+    def __del__(self):
+        self._aio_boto_client.close()
+        self._session.close()  # why is this not implicit?
+
     async def _parse_response(self, operation_name: str, http_response: aiohttp.ClientResponse):
         parser = self._parsers.get(operation_name, None)
         if parser is None:
@@ -337,9 +341,6 @@ class Bucket:
             raise botocore.exceptions.ClientError(parsed_response, operation_name)
 
         return parsed_response
-
-    def __del__(self):
-        self._session.close()  # why is this not implicit?
 
     async def get_location(self):
         response = await self._request("GET", "/", 'GetBucketLocation', params={'location': ''})
@@ -558,7 +559,7 @@ class Bucket:
                     response = await asyncio.wait_for(self._session.request(method=req.method, url=req.url, params=req.params, headers=req.headers, data=req.body),
                                                        self._timeout, loop=self._loop)
 
-                    parsed_response = await self._parse_response('GetObject', response)
+                    parsed_response = await self._parse_response(op_name, response)
                 except (KeyboardInterrupt, SystemExit, MemoryError, asyncio.CancelledError):
                     raise
                 except botocore.exceptions.ClientError as e:
