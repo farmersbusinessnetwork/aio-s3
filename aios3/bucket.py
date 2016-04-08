@@ -351,20 +351,37 @@ class Bucket:
 
         return any(map(Key.from_dict, response["Contents"]))
 
-    async def list(self, prefix='', delimiter=None, max_keys=1000, allow_truncated=False, marker=None):
+    async def list_object_versions(self, Delimiter=None, KeyMarker=None, Prefix=None, VersionIdMarker=None, MaxKeys=None):
+        params = {'versions': ''}
+
+        if Delimiter is not None:
+            params['delimiter'] = Delimiter
+        if KeyMarker is not None:
+            params['key-marker'] = KeyMarker
+        if MaxKeys is not None:  # default is 1000
+            params['max-keys'] = MaxKeys
+        if Prefix is not None:
+            params['prefix'] = Prefix
+        if VersionIdMarker is not None:
+            params['VersionIdMarker'] = VersionIdMarker
+
+        response = await self._request("GET", "/", 'ListObjectVersions', params)
+        return response
+
+    async def list(self, Prefix='', Delimiter=None, MaxKeys=1000, Marker=None, allow_truncated=False):
         params = {
-            'prefix': prefix,
-            'max-keys': str(max_keys),
+            'prefix': Prefix,
+            'max-keys': str(MaxKeys),
 
             # If you need to support extended characters enable this and then url decode the Key
             # 'encoding-type': 'url'
         }
 
-        if marker:
-            params['marker'] = marker
+        if Marker is not None:
+            params['marker'] = Marker
 
-        if delimiter:
-            params['delimiter'] = delimiter
+        if Delimiter is not None:
+            params['delimiter'] = Delimiter
 
         response = await self._request("GET", "/", 'ListObjects', params)
 
@@ -373,15 +390,13 @@ class Bucket:
 
         return response
 
-    def list_by_chunks(self, prefix='', delimiter=None, max_keys=1000):
+    def list_by_chunks(self, Prefix='', Delimiter=None, MaxKeys=1000):
         class Pager:
-            def __init__(self, bucket: Bucket, prefix='', delimiter=None, max_keys=1000):
+            def __init__(self, bucket: Bucket):
                 self.bucket = bucket
                 self.final = False
                 self.marker = ''
-                self.prefix = prefix
-                self.delimiter = delimiter
-                self.max_keys = max_keys
+                self.prefix = Prefix
 
             async def __anext__(self):
                 if self.final: raise StopAsyncIteration
@@ -393,19 +408,16 @@ class Bucket:
             async def next_page(self):
                 if self.final: return None
 
-                result = await self.bucket.list(prefix, delimiter, allow_truncated=True, marker=self.marker)
+                result = await self.bucket.list(Prefix, Delimiter, allow_truncated=True, marker=self.marker, max_keys=MaxKeys)
 
                 if not result['IsTruncated']:
                     self.final = True
                 else:
-                    if 'NextMarker' not in result:  # amazon, really?
-                        self.marker = result['Contents'][-1]['Key']
-                    else:
-                        self.marker = result['NextMarker']
+                    self.marker = result.get('NextMarker', result['Contents'][-1]['Key'])
 
                 return result
 
-        return Pager(self, prefix, delimiter, max_keys)
+        return Pager(self)
 
     async def head(self, key, versionId=None):
         if isinstance(key, Key):
@@ -541,7 +553,9 @@ class Bucket:
         response.status = 500
 
         # TODO: perhaps switch to client._endpoint._needs_retry
-        retry_handler = self._retry_handler(request_retries or self._num_retries)
+        if request_retries is None:
+            request_retries = self._num_retries
+        retry_handler = self._retry_handler(request_retries)
 
         # Note: from what I gather these errors are to be expected all the time
         #       either that or there are several connection issues in aiohttp
