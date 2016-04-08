@@ -34,32 +34,6 @@ def _safe_list(obj):
     return obj
 
 
-# TODO: get rid of this Key to match botocore
-# TODO: re-write aio-s3 to return the same exceptions as aiobotocore (everything should behave like aiobotocore)
-class Key:
-    def __init__(self, *, key, last_modified, etag, size, storage_class):
-        self.key = key
-        self.last_modified = last_modified
-        self.etag = etag
-        self.size = int(size)
-        self.storage_class = storage_class
-
-    @classmethod
-    def from_dict(Key, d):
-        last_modified = d['LastModified']
-
-        if not isinstance(last_modified, datetime.datetime):
-            last_modified = dateutil.parser.parse(last_modified)
-
-        return Key(
-            key=d['Key'], last_modified=last_modified,
-            etag=d['ETag'], size=d['Size'], storage_class=d['StorageClass']
-        )
-
-    def __repr__(self):
-        return '<Key {}:{}>'.format(self.key, self.size)
-
-
 # async io exponential delay retry handler
 class _RetryHandler:
     _delay_multiplier = 5
@@ -349,7 +323,7 @@ class Bucket:
     async def exists(self, prefix=''):
         response = await self._request("GET", "/", 'ListObjects', {'prefix': prefix, 'separator': '/', 'max-keys': '1'})
 
-        return any(map(Key.from_dict, response["Contents"]))
+        return len(response["Contents"]) > 0
 
     async def list_object_versions(self, Delimiter=None, KeyMarker=None, Prefix=None, VersionIdMarker=None, MaxKeys=None):
         params = {'versions': ''}
@@ -419,21 +393,15 @@ class Bucket:
 
         return Pager(self)
 
-    async def head(self, key, versionId=None):
-        if isinstance(key, Key):
-            key = key.key
-
-        params = {} if versionId is None else {'versionId': versionId}
-        response = await self._request("HEAD", '/' + key, 'HeadObject', params)
+    async def head(self, Key, VersionId=None):
+        params = {} if VersionId is None else {'versionId': VersionId}
+        response = await self._request("HEAD", '/' + Key, 'HeadObject', params)
 
         return response
 
-    async def download(self, key, versionId=None):
-        if isinstance(key, Key):
-            key = key.key
-
-        params = {} if versionId is None else {'versionId': versionId}
-        response = await self._request("GET", '/' + key, 'GetObject', params)
+    async def download(self, Key, VersionId=None):
+        params = {} if VersionId is None else {'versionId': VersionId}
+        response = await self._request("GET", '/' + Key, 'GetObject', params)
 
         return response
 
@@ -441,7 +409,7 @@ class Bucket:
         data = open(file_path, 'rb').read()
         await self.upload(key, data, len(data))
 
-    async def upload(self, key, data, content_length=None, content_type='application/octed-stream', metadata=None, num_retries=None):
+    async def upload(self, Key, Body, ContentLength=None, ContentType='application/octed-stream', Metadata=None, num_retries=None):
         """Upload file to S3
 
         The `data` might be a generator or stream.
@@ -451,30 +419,23 @@ class Bucket:
 
         Note: Riak CS doesn't allow to upload files without content_length.
         """
-        if isinstance(key, Key):
-            key = key.key
+        if isinstance(Body, str):
+            Body = Body.encode('utf-8')
 
-        if isinstance(data, str):
-            data = data.encode('utf-8')
+        headers = {'CONTENT-TYPE': ContentType}
 
-        headers = {'CONTENT-TYPE': content_type}
+        if ContentLength is not None:
+            headers['CONTENT-LENGTH'] = str(ContentLength)
 
-        if content_length is not None:
-            headers['CONTENT-LENGTH'] = str(content_length)
-
-        if metadata:
-            for k, v in metadata:
+        if Metadata:
+            for k, v in Metadata:
                 headers['x-amz-meta-' + k] = str(v)
 
-        response = await self._request("PUT", '/' + key, 'PutObject', headers=headers, payload=data, request_retries=num_retries)
-
+        response = await self._request("PUT", '/' + Key, 'PutObject', headers=headers, payload=Body, request_retries=num_retries)
         return response
 
-    async def delete(self, key):
-        if isinstance(key, Key):
-            key = key.key
-
-        response = await self._request("DELETE", '/' + key, 'DeleteObject')
+    async def delete(self, Key):
+        response = await self._request("DELETE", '/' + Key, 'DeleteObject')
         return response
 
     # boto style
@@ -502,24 +463,21 @@ class Bucket:
         response = await self._request("POST", '/', 'DeleteObjects', params=params, headers=headers, payload=body)
         return response
 
-    async def copy(self, copy_source, key):
-        if isinstance(key, Key):
-            key = key.key
-
-        response = await self._request("PUT", '/' + key, 'CopyObject', headers={'x-amz-copy-source': copy_source})
+    async def copy(self, CopySource, Key):
+        response = await self._request("PUT", '/' + Key, 'CopyObject', headers={'x-amz-copy-source': CopySource})
         return response
 
-    async def get(self, key, IfMatch=None, Range=None, num_retries=None):
-        if isinstance(key, Key):
-            key = key.key
+    async def get(self, Key, IfMatch=None, Range=None, VersionId=None, num_retries=None):
 
         headers = dict()
-        if IfMatch:
+        params = {} if VersionId is None else {'versionId': VersionId}
+
+        if IfMatch is not None:
             headers['If-Match'] = IfMatch
-        if Range:
+        if Range is not None:
             headers['Range'] = Range
 
-        response = await self._request("GET", '/' + key, 'GetObject', headers=headers, request_retries=num_retries)
+        response = await self._request("GET", '/' + Key, 'GetObject', params=params, headers=headers, request_retries=num_retries)
 
         return response
 
@@ -589,32 +547,26 @@ class Bucket:
 
         return parsed_response
 
-    async def upload_multipart(self, key, content_type='application/octed-stream',
+    async def upload_multipart(self, Key, content_type='application/octed-stream',
                                MultipartUpload=MultipartUpload, metadata=None):
         """Upload file to S3 by uploading multiple chunks"""
-
-        if isinstance(key, Key):
-            key = key.key
 
         headers = {'CONTENT-TYPE': content_type}
         if metadata is None: metadata = dict()
         for n, v in metadata.items():
             headers["x-amz-meta-" + n] = v
 
-        response = await self._request("POST", '/' + key, 'CreateMultipartUpload', params={'uploads': ''}, headers=headers)
+        response = await self._request("POST", '/' + Key, 'CreateMultipartUpload', params={'uploads': ''}, headers=headers)
 
         upload_id = response['UploadId']
 
         assert upload_id
-        return MultipartUpload(self, key, upload_id)
+        return MultipartUpload(self, Key, upload_id)
 
-    async def abort_multipart_upload(self, key, upload_id):
-        if isinstance(key, Key):
-            key = key.key
+    async def abort_multipart_upload(self, Key, upload_id):
+        return await self._request("DELETE", '/' + Key, 'AbortMultipartUpload', {"uploadId": upload_id})
 
-        return await self._request("DELETE", '/' + key, 'AbortMultipartUpload', {"uploadId": upload_id})
-
-    def list_multipart_uploads_by_chunks(self, prefix='', max_uploads=1000):
+    def list_multipart_uploads_by_chunks(self, Prefix='', max_uploads=1000):
         class _Pager:
             def __init__(self, parent: Bucket):
                 self._parent = parent
@@ -624,12 +576,12 @@ class Bucket:
 
             async def next_page(self):
                 params = {'max-uploads': str(max_uploads), 'uploads': ''}
-                if len(prefix):
-                    params['prefix'] = prefix
+                if len(Prefix):
+                    params['prefix'] = Prefix
 
                 if len(self._key_marker):
                     params['key-marker'] = self._key_marker
-                    params['upload-id-market'] = self._upload_id_marker
+                    params['upload-id-marker'] = self._upload_id_marker
 
                 response = await self._parent._request("GET", "/", 'ListMultipartUploads', params)
 
