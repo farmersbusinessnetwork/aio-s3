@@ -1,9 +1,7 @@
-import datetime
 import logging
 import asyncio
 import xmltodict
 import collections
-import dateutil.parser
 import time
 from functools import partial
 from urllib.parse import quote

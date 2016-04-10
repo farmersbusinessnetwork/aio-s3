@@ -14,7 +14,7 @@ setup(name='aio-s3',
       packages=[
           'aios3',
       ],
-      install_requires=['aiobotocore'],
+      install_requires=['aiobotocore', 'xml2dict'],
       classifiers=[
           'Development Status :: 4 - Beta',
           'Programming Language :: Python :: 3.5',
