@@ -407,7 +407,7 @@ class Bucket:
         data = open(file_path, 'rb').read()
         await self.upload(key, data, len(data))
 
-    async def upload(self, Key, Body, ContentLength=None, ContentType='application/octed-stream', Metadata=None, num_retries=None):
+    async def upload(self, Key, Body, ContentLength=None, ContentType=None, Metadata=None, num_retries=None):
         """Upload file to S3
 
         The `data` might be a generator or stream.
@@ -420,7 +420,10 @@ class Bucket:
         if isinstance(Body, str):
             Body = Body.encode('utf-8')
 
-        headers = {'CONTENT-TYPE': ContentType}
+        headers = dict()
+
+        if ContentType is not None:
+            headers['CONTENT-TYPE'] = ContentType
 
         if ContentLength is not None:
             headers['CONTENT-LENGTH'] = str(ContentLength)
