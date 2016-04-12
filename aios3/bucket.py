@@ -74,6 +74,17 @@ class _RetryHandler:
         return False
 
 
+def get_maximum_timeout(timeout: float or int, max_attempts: int) -> float:
+    """
+    Will return the maximum combined timeout based on the maximum number of attempts
+    :param timeout: timeout in seconds per request
+    :param max_attempts: maximum number of attempts
+    :return: maximimum combined timeout in seconds
+    """
+    rh = _RetryHandler(timeout, max_attempts)
+    return rh.max_timeout()
+
+
 class ObjectChunk(object):
     def __init__(self, bucket, key, firstByte, lastByte, versionId=None, partNum=None):
         if isinstance(bucket, Bucket):
@@ -186,17 +197,6 @@ class Bucket:
                 avg_time = round(sum(self._bucket._request_times) / len(self._bucket._request_times), 3)
                 self._bucket._logger.info("aios3 concurrency:{} lag min:{} avg:{} max:{} num:{}".format(self._bucket._concurrent, min_time, avg_time, max_time, len(self._bucket._request_times)))
                 self._bucket._request_times.clear()
-
-    @staticmethod
-    def get_maximum_timeout(timeout: float or int, max_attempts: int) -> float:
-        """
-        Will return the maximum combined timeout based on the maximum number of attempts
-        :param timeout: timeout in seconds per request
-        :param max_attempts: maximum number of attempts
-        :return: maximimum combined timeout in seconds
-        """
-        rh = _RetryHandler(timeout, max_attempts)
-        return rh.max_timeout()
 
     def __init__(self, name, *,
                  aws_region='us-west-2',
