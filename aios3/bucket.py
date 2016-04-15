@@ -1,21 +1,24 @@
-import datetime
 import logging
 import asyncio
 import xmltodict
 import collections
-import dateutil.parser
 import time
-import botocore.auth
-import botocore.session
-import botocore.client
-import botocore.credentials
 from functools import partial
 from urllib.parse import quote
 import aiohttp
 import hashlib
 import base64
+import functools
 
-from . import errors
+import botocore.auth
+import botocore.exceptions
+import botocore.session
+import botocore.client
+import botocore.credentials
+
+import aiobotocore  # we use this to parse the response, it needs to be aiobotocore due to the aiohttp response object
+import aiobotocore.client
+from aiobotocore.endpoint import convert_to_response_dict
 
 # NOTE: if we ever enable this we'll need to support checking for signature expiration
 PRESIGN_SUPPORT = False
@@ -29,30 +32,57 @@ def _safe_list(obj):
     return obj
 
 
-# TODO: get rid of this Key to match botocore
-# TODO: re-write aio-s3 to return the same exceptions as aiobotocore (everything should behave like aiobotocore)
-class Key:
-    def __init__(self, *, key, last_modified, etag, size, storage_class):
-        self.key = key
-        self.last_modified = last_modified
-        self.etag = etag
-        self.size = int(size)
-        self.storage_class = storage_class
+# async io exponential delay retry handler
+class _RetryHandler:
+    _delay_multiplier = 5
+    _initial_delay = 0.1
 
-    @classmethod
-    def from_dict(Key, d):
-        last_modified = d['LastModified']
+    def __init__(self, num_retries, timeout):
+        self._max_retries = num_retries
+        self._retry_num = 0  # first "retry" is actually the first request with 0 delay
+        self._delay = self._initial_delay
+        self._timeout = timeout
 
-        if not isinstance(last_modified, datetime.datetime):
-            last_modified = dateutil.parser.parse(last_modified)
+    @property
+    def retry_num(self):
+        return self._retry_num
 
-        return Key(
-            key=d['Key'], last_modified=last_modified,
-            etag=d['ETag'], size=d['Size'], storage_class=d['StorageClass']
-        )
+    @property
+    def max_retries(self):
+        return self._max_retries
 
-    def __repr__(self):
-        return '<Key {}:{}>'.format(self.key, self.size)
+    # exponential function: y = k(m^x) where k is initial value, m is multiplier, x is number of iterations
+    def max_timeout(self):
+        # maximum total delay + maximum total timeout for each request
+        delay = 0
+        for i in range(self._max_retries):
+            delay += self._initial_delay * (self._delay_multiplier ** i)
+        return delay + (self._timeout * (self._max_retries + 1))
+
+    def can_retry(self):
+        return self._retry_num < (self._max_retries + 1)  # plus initial request
+
+    async def retry(self):
+        """ Will asyncio.sleep and return True during allowable retries, otherwise return False """
+        if self._retry_num < (self._max_retries + 1):  # plus initial request
+            if self._retry_num != 0:
+                await asyncio.sleep(self._delay)
+                self._delay *= 5  # 0->0.1->0.5->2.5->12.5->62.5->etc
+            self._retry_num += 1
+            return True
+
+        return False
+
+
+def get_maximum_timeout(timeout: float or int, max_attempts: int) -> float:
+    """
+    Will return the maximum combined timeout based on the maximum number of attempts
+    :param timeout: timeout in seconds per request
+    :param max_attempts: maximum number of attempts
+    :return: maximimum combined timeout in seconds
+    """
+    rh = _RetryHandler(timeout, max_attempts)
+    return rh.max_timeout()
 
 
 class ObjectChunk(object):
@@ -96,37 +126,27 @@ class MultipartUpload(object):
             'CONTENT-TYPE': 'application/octed-stream',
         }
 
-        is_copy = False
         if isinstance(data, ObjectChunk):
             obj_chunk = data
             data = b''
-            srcPath = "/{0}/{1}".format(obj_chunk.bucket, amz_uriencode(obj_chunk.key))
+            src_path = "/{0}/{1}".format(obj_chunk.bucket, amz_uriencode(obj_chunk.key))
             if obj_chunk.versionId is not None:
-                srcPath = srcPath + "?versionId={0}".format(obj_chunk.versionId)
-            headers['x-amz-copy-source'] = srcPath
+                src_path += "?versionId={0}".format(obj_chunk.versionId)
+            headers['x-amz-copy-source'] = src_path
             headers['x-amz-copy-source-range'] = "bytes={0}-{1}".format(obj_chunk.firstByte, obj_chunk.lastByte)
-            is_copy = True
 
-        response, xml = await self.bucket._request("PUT", '/' + self.key, {
+        response = await self.bucket._request("PUT", '/' + self.key, 'UploadPart', {
                 'uploadId': self.upload_id,
                 'partNumber': str(part_num),
             }, headers=headers, payload=data)
 
-        if not is_copy:
-            etag = response.headers['ETAG']   # per AWS docs get the etag from the headers
-        else:
-            # Per AWS docs if copy case need to get the etag from the XML response
-            xml = xmltodict.parse(xml)["CopyPartResult"]
-            etag = xml["ETag"]
-            if etag.startswith("\""): etag = etag[1:-1]
-
-        self.parts[part_num] = etag
+        self.parts[part_num] = response['ETag']
 
     async def commit(self):
         if self._done:
             raise RuntimeError("Can't commit twice or after close")
-        self._done = True
 
+        self._done = True
         self.parts = [{'PartNumber': n, 'ETag': etag} for n, etag in self.parts.items()]
         self.parts = sorted(self.parts, key=lambda x: x['PartNumber'])
 
@@ -134,12 +154,11 @@ class MultipartUpload(object):
 
         data = xmltodict.unparse(xml, full_document=False).encode('utf8')
 
-        response, xml = await self.bucket._request("POST", '/' + self.key, {
+        response = await self.bucket._request("POST", '/' + self.key, 'CompleteMultipartUpload', {
                 'uploadId': self.upload_id,
             }, headers={'CONTENT-TYPE': 'application/xml'}, payload=data)
 
-        xml = xmltodict.parse(xml)['CompleteMultipartUploadResult']
-        return xml
+        return response
 
     async def close(self):
         if self._done:
@@ -147,7 +166,7 @@ class MultipartUpload(object):
 
         self._done = True
 
-        await self.bucket._request("DELETE", '/' + self.key, {'uploadId': self.upload_id})
+        return await self.bucket._request("DELETE", '/' + self.key, 'AbortMultipartUpload', {'uploadId': self.upload_id})
 
 
 # TODO get rid of idea of Bucket class and instead have a session that does NOT know the bucket
@@ -210,13 +229,15 @@ class Bucket:
         self._num_requests = 0
         self._aws_region = aws_region
         self._boto_creds = boto_creds
-        self._boto_session = None
         self._timeout = timeout
         self._logger = logger
         self._loop = loop
         self._presign_cache = dict()  # (method, params) -> url
         self._cache_hits = 0
         self._cache_misses = 0
+        self._retry_handler = functools.partial(_RetryHandler, timeout=self._timeout)
+        self._scheme = scheme
+        self._aio_boto_session = None
 
         # Virtual style host URL
         # ----------------------
@@ -225,14 +246,12 @@ class Bucket:
         #
         # Path Style
         # ----------
-        #   endpoint:  s3.amazonaws.com/bucket / s3-aws-region.amazonaws.com/bucket
-        #       host: s3.amazonaws.com
+        #   endpoint: s3.amazonaws.com/bucket / s3-aws-region.amazonaws.com/bucket
+        #   host: s3.amazonaws.com
         #
 
         # We use Path Style because the Amazon SSL wildcard cert will not match for virtual style with buckets
         # that have '.'s: http://docs.aws.amazon.com/AmazonS3/latest/dev/BucketRestrictions.html
-
-        self._scheme = scheme
 
         if aws_region == 'us-east-1':
             self._host = "s3.amazonaws.com"
@@ -241,10 +260,6 @@ class Bucket:
 
         self._endpoint = self._host + "/" + self._name
 
-        if self._boto_creds is None:
-            self._boto_session = botocore.session.get_session()
-            self._boto_creds = botocore.credentials.create_credential_resolver(self._boto_session).load_credentials()
-
         if self._connector is None:
             kwargs = {}
             if timeout:
@@ -252,16 +267,25 @@ class Bucket:
 
             self._connector = aiohttp.TCPConnector(force_close=False, keepalive_timeout=10, use_dns_cache=False, loop=self._loop, **kwargs)
 
-        self._session = aiohttp.ClientSession(connector=self._connector, loop=self._loop)
+        use_ssl = self._scheme == 'https'
+
+        connector_args = {
+            'use_dns_cache': self._connector._use_dns_cache,
+            'force_close': self._connector._force_close,
+            'keepalive_timeout': self._connector._keepalive_timeout}
+
+        aio_config = aiobotocore.client.AioConfig(signature_version='s3v4', connector_args=connector_args)
+
+        self._aio_boto_session = aiobotocore.get_session(loop=self._loop)
+        self._aio_boto_client = self._aio_boto_session.create_client('s3', region_name=self._aws_region, config=aio_config, use_ssl=use_ssl)
+
+        self._parsers = dict()  # OpName: (op_model, parser) map
+
+        if self._boto_creds is None:
+            self._boto_creds = botocore.credentials.create_credential_resolver(self._aio_boto_session).load_credentials()
+
+        self._session = aiohttp.ClientSession(connector=self._connector, loop=self._loop, response_class=aiobotocore.endpoint.ClientResponseProxy)
         self._signer = botocore.auth.S3SigV4Auth(self._boto_creds, 's3', self._aws_region)
-
-        if PRESIGN_SUPPORT:
-            if self._boto_session is None:
-                self._boto_session = botocore.session.get_session()
-
-            config = botocore.client.Config(signature_version='s3v4')
-            use_ssl = self._scheme == 'https'
-            self._boto_client = self._boto_session.create_client('s3', region_name=aws_region, use_ssl=use_ssl, config=config)
 
         # stats support
         self._concurrent = 0
@@ -269,79 +293,82 @@ class Bucket:
         self._request_times = []
 
     def __del__(self):
+        self._aio_boto_client.close()
         self._session.close()  # why is this not implicit?
 
-    async def getLocation(self):
-        response, data = await self._request("GET", "/", params={'location': ''})
+    async def _parse_response(self, operation_name: str, http_response: aiohttp.ClientResponse):
+        parser = self._parsers.get(operation_name, None)
+        if parser is None:
+            operation_model = self._aio_boto_client.meta.service_model.operation_model(operation_name)
+            response_parser_factory = self._aio_boto_session.get_component('response_parser_factory')
+            parser = operation_model, response_parser_factory.create_parser(operation_model.metadata['protocol'])
+            self._parsers[operation_name] = parser
 
-        x = xmltodict.parse(data)
-        region = x['LocationConstraint']
-        if ('#text' not in region) or (len(region) == 0):
-            return 'us-east-1'
+        operation_model, parser = parser
 
-        return region['#text']
+        response_dict = await convert_to_response_dict(http_response, operation_model)
+        parsed_response = parser.parse(response_dict, operation_model.output_shape)
+
+        if http_response.status >= 300:
+            raise botocore.exceptions.ClientError(parsed_response, operation_name)
+
+        return parsed_response
+
+    async def get_location(self):
+        response = await self._request("GET", "/", 'GetBucketLocation', params={'location': ''})
+        return response
 
     async def exists(self, prefix=''):
-        response, data = await self._request("GET", "/", {'prefix': prefix, 'separator': '/', 'max-keys': '1'})
+        response = await self._request("GET", "/", 'ListObjects', {'prefix': prefix, 'separator': '/', 'max-keys': '1'})
 
-        x = xmltodict.parse(data)['ListBucketResult']
-        return any(map(Key.from_dict, x["Contents"]))
+        return len(response["Contents"]) > 0
 
-    async def list(self, prefix='', delimiter=None, max_keys=1000, boto_style=False, allow_truncated=False, marker=None):
+    async def list_object_versions(self, Delimiter=None, KeyMarker=None, Prefix=None, VersionIdMarker=None, MaxKeys=None):
+        params = {'versions': ''}
+
+        if Delimiter is not None:
+            params['delimiter'] = Delimiter
+        if KeyMarker is not None:
+            params['key-marker'] = KeyMarker
+        if MaxKeys is not None:  # default is 1000
+            params['max-keys'] = MaxKeys
+        if Prefix is not None:
+            params['prefix'] = Prefix
+        if VersionIdMarker is not None:
+            params['VersionIdMarker'] = VersionIdMarker
+
+        response = await self._request("GET", "/", 'ListObjectVersions', params)
+        return response
+
+    async def list(self, Prefix='', Delimiter=None, MaxKeys=1000, Marker=None, allow_truncated=False):
         params = {
-            'prefix': prefix,
-            'max-keys': str(max_keys),
+            'prefix': Prefix,
+            'max-keys': str(MaxKeys),
 
             # If you need to support extended characters enable this and then url decode the Key
             # 'encoding-type': 'url'
         }
 
-        if marker:
-            params['marker'] = marker
+        if Marker is not None:
+            params['marker'] = Marker
 
-        if delimiter:
-            params['delimiter'] = delimiter
+        if Delimiter is not None:
+            params['delimiter'] = Delimiter
 
-        response, data = await self._request("GET", "/", params)
+        response = await self._request("GET", "/", 'ListObjects', params)
 
-        x = xmltodict.parse(data)['ListBucketResult']
-
-        if x['IsTruncated'] != 'false' and not allow_truncated:
+        if response['IsTruncated'] and not allow_truncated:
             raise AssertionError("File list is truncated, use bigger max_keys")
 
-        if boto_style:
-            x['IsTruncated'] = x['IsTruncated'] == 'true'
-            x['MaxKeys'] = int(x['MaxKeys'])
+        return response
 
-            if 'Contents' not in x:
-                x['Contents'] = []
-            elif not isinstance(x['Contents'], list):
-                x['Contents'] = [x['Contents']]
-
-            for c in x['Contents']:
-                # Note these pickle to 105 bytes!  Interesting fact is that dateutil is faster than strptime
-                c['LastModified'] = dateutil.parser.parse(c['LastModified'])
-                c['Size'] = int(c['Size'])
-
-            if 'CommonPrefixes' not in x:
-                x['CommonPrefixes'] = []
-            elif not isinstance(x['CommonPrefixes'], list):
-                x['CommonPrefixes'] = [x['CommonPrefixes']]
-
-            return x
-        else:
-            return list(map(Key.from_dict, _safe_list(x["Contents"])))
-
-    def list_by_chunks(self, prefix='', delimiter=None, boto_style=False, max_keys=1000):
+    def list_by_chunks(self, Prefix='', Delimiter=None, MaxKeys=1000):
         class Pager:
-            def __init__(self, bucket: Bucket, prefix='', delimiter=None, boto_style=False, max_keys=1000):
+            def __init__(self, bucket: Bucket):
                 self.bucket = bucket
                 self.final = False
                 self.marker = ''
-                self.prefix = prefix
-                self.delimiter = delimiter
-                self.boto_style = boto_style
-                self.max_keys = max_keys
+                self.prefix = Prefix
 
             async def __anext__(self):
                 if self.final: raise StopAsyncIteration
@@ -353,43 +380,26 @@ class Bucket:
             async def next_page(self):
                 if self.final: return None
 
-                result = await self.bucket.list(prefix, delimiter, boto_style=True, allow_truncated=True, marker=self.marker)
+                result = await self.bucket.list(Prefix, Delimiter, allow_truncated=True, marker=self.marker, max_keys=MaxKeys)
 
                 if not result['IsTruncated']:
                     self.final = True
                 else:
-                    if 'NextMarker' not in result:  # amazon, really?
-                        self.marker = result['Contents'][-1]['Key']
-                    else:
-                        self.marker = result['NextMarker']
+                    self.marker = result.get('NextMarker', result['Contents'][-1]['Key'])
 
-                if self.boto_style:
-                    return result
-                else:
-                    return list(map(Key.from_dict, _safe_list(result["Contents"])))
+                return result
 
-        return Pager(self, prefix, delimiter, boto_style, max_keys)
+        return Pager(self)
 
-    async def head(self, key, versionId=None):
-        if isinstance(key, Key):
-            key = key.key
+    async def head(self, Key, VersionId=None):
+        params = {} if VersionId is None else {'versionId': VersionId}
+        response = await self._request("HEAD", '/' + Key, 'HeadObject', params)
 
-        params = {} if versionId is None else {'versionId': versionId}
-        response, xml = await self._request("HEAD", '/' + key, params)
+        return response
 
-        obj = {'Metadata': dict()}
-        for h, v in response.headers.items():
-            if not h.startswith('X-AMZ-META-'): continue
-            obj['Metadata'][h[11:].lower()] = v  # boto3 returns keys in lowercase
-
-        return obj
-
-    async def download(self, key, versionId=None):
-        if isinstance(key, Key):
-            key = key.key
-
-        params = {} if versionId is None else {'versionId' : versionId}
-        response, data = await self._request("GET", '/' + key, params)
+    async def download(self, Key, VersionId=None):
+        params = {} if VersionId is None else {'versionId': VersionId}
+        response = await self._request("GET", '/' + Key, 'GetObject', params)
 
         return response
 
@@ -397,7 +407,7 @@ class Bucket:
         data = open(file_path, 'rb').read()
         await self.upload(key, data, len(data))
 
-    async def upload(self, key, data, content_length=None, content_type='application/octed-stream'):
+    async def upload(self, Key, Body, ContentLength=None, ContentType=None, Metadata=None, num_retries=None):
         """Upload file to S3
 
         The `data` might be a generator or stream.
@@ -407,28 +417,27 @@ class Bucket:
 
         Note: Riak CS doesn't allow to upload files without content_length.
         """
-        if isinstance(key, Key):
-            key = key.key
+        if isinstance(Body, str):
+            Body = Body.encode('utf-8')
 
-        if isinstance(data, str):
-            data = data.encode('utf-8')
+        headers = dict()
 
-        headers = {'CONTENT-TYPE': content_type}
+        if ContentType is not None:
+            headers['CONTENT-TYPE'] = ContentType
 
-        if content_length is not None:
-            headers['CONTENT-LENGTH'] = str(content_length)
+        if ContentLength is not None:
+            headers['CONTENT-LENGTH'] = str(ContentLength)
 
-        response, xml = await self._request("PUT", '/' + key, headers=headers, payload=data)
+        if Metadata:
+            for k, v in Metadata:
+                headers['x-amz-meta-' + k] = str(v)
 
-        return xml, dict(response.headers)
+        response = await self._request("PUT", '/' + Key, 'PutObject', headers=headers, payload=Body, request_retries=num_retries)
+        return response
 
-    async def delete(self, key):
-        if isinstance(key, Key):
-            key = key.key
-
-        response, xml = await self._request("DELETE", '/' + key)
-
-        return xml
+    async def delete(self, Key):
+        response = await self._request("DELETE", '/' + Key, 'DeleteObject')
+        return response
 
     # boto style
     async def delete_objects(self, Delete, MFA=None, RequestPayer=None):
@@ -451,50 +460,29 @@ class Bucket:
         if MFA:
             headers['x-amz-mfa'] = MFA
 
-        response, xml = await self._request("POST", '/?delete', headers=headers, payload=body)
-        response = xmltodict.parse(xml)['DeleteResult']
-        if 'Deleted' not in response:
-            response['Deleted'] = []
-        elif not isinstance(response['Deleted'], list):
-            response['Deleted'] = [response['Deleted']]
+        params = {'delete': ''}
+        response = await self._request("POST", '/', 'DeleteObjects', params=params, headers=headers, payload=body)
+        return response
 
-        if 'Error' not in response:
-            response['Error'] = []
-        elif not isinstance(response['Error'], list):
-            response['Error'] = [response['Error']]
+    async def copy(self, CopySource, Key):
+        response = await self._request("PUT", '/' + Key, 'CopyObject', headers={'x-amz-copy-source': CopySource})
+        return response
+
+    async def get(self, Key, IfMatch=None, Range=None, VersionId=None, num_retries=None):
+
+        headers = dict()
+        params = {} if VersionId is None else {'versionId': VersionId}
+
+        if IfMatch is not None:
+            headers['If-Match'] = IfMatch
+        if Range is not None:
+            headers['Range'] = Range
+
+        response = await self._request("GET", '/' + Key, 'GetObject', params=params, headers=headers, request_retries=num_retries)
 
         return response
 
-    # encode_uri is for old users of this API
-    async def copy(self, copy_source, key):
-        if isinstance(key, Key):
-            key = key.key
-
-        response, xml = await self._request("PUT", '/' + key, {}, {'x-amz-copy-source': copy_source})
-
-        return xmltodict.parse(xml)["CopyObjectResult"]
-
-    async def get(self, key):
-        if isinstance(key, Key):
-            key = key.key
-
-        if PRESIGN_SUPPORT:
-            pre_key = ('get_object', {'Bucket': self._name, 'Key': key})
-            try:
-                ps_url = self._presign_cache[key]
-                self._cache_hits += 1
-            except:
-                self._cache_misses += 1
-                ps_url = self._boto_client.generate_presigned_url(pre_key[0], Params=pre_key[1])
-                self._presign_cache[key] = ps_url
-
-            response, data = await self._request("GET", None, presigned_url=ps_url)
-        else:
-            response, data = await self._request("GET", '/' + key)
-
-        return data, dict(response.headers)
-
-    async def _request(self, method, resource, params=None, headers=None, payload=b'', presigned_url=None):
+    async def _request(self, method: str, resource: str, op_name: str, params=None, headers=None, payload=b'', presigned_url=None, request_retries: None or int=None):
         # we need to pre-encode the url because the signature needs to match the final url
         resource = quote(resource)
 
@@ -522,116 +510,91 @@ class Bucket:
 
         response = lambda: None
         response.status = 500
-        retries = 0
-        data = b''
-        next_wait = 0.1
+
+        # TODO: perhaps switch to client._endpoint._needs_retry
+        if request_retries is None:
+            request_retries = self._num_retries
+        retry_handler = self._retry_handler(request_retries)
 
         # Note: from what I gather these errors are to be expected all the time
         #       either that or there are several connection issues in aiohttp
         #       also from what I've seen we usually never have to go beyond one retry
         with Bucket.StatsUpdater(self):
-            while retries < self._num_retries:
+            while await retry_handler.retry() and response.status not in [200, 204]:
                 self._num_requests += 1
+
+                req = S3Request(headers, params, payload, method, url)
+
                 if not presigned_url:
-                    req = S3Request(headers, params, payload, method, url)
                     self._signer.add_auth(req)
 
                 try:
-                    async with (await asyncio.wait_for(self._session.request(req.method, req.url, params=req.params, headers=req.headers, data=req.body),
-                                                       self._timeout, loop=self._loop)) as response:
-                        data = await response.read()
+                    response = await asyncio.wait_for(self._session.request(method=req.method, url=req.url, params=req.params, headers=req.headers, data=req.body),
+                                                       self._timeout, loop=self._loop)
 
-                    if response.status not in [200, 204]:
-                        # this can raise a RuntimeError
-                        errors.AWSException.from_bytes(response.status, data, url)
+                    parsed_response = await self._parse_response(op_name, response)
                 except (KeyboardInterrupt, SystemExit, MemoryError, asyncio.CancelledError):
                     raise
-                except Exception as e:
-                    retries += 1
-                    self._logger.info('Retrying {}/{} request:{} exception:{}'.format(retries, self._num_retries, req, e))
-                    if retries == self._num_retries:
+                except botocore.exceptions.ClientError as e:
+                    if not retry_handler.can_retry() or e.response['ResponseMetadata']['HTTPStatusCode'] in [404, 412]:
                         raise
-                    continue
 
-                if response.status not in [200, 204]:
-                    # retry everything as we're not sure we can trust any S3 error
-                    retries += 1
-                    err = errors.AWSException.from_bytes(response.status, data, url)
+                    self._logger.warning('Retrying {}/{} request:{} exception:{}'.format(retry_handler.retry_num, retry_handler.max_retries, req, e))
+                except Exception as e:
+                    if not retry_handler.can_retry():
+                        raise
 
-                    self._logger.warning("Retrying {}/{} request:{} error:{}".format(retries, self._num_retries, req, err))
+                    self._logger.warning('Retrying {}/{} request:{} exception:{}'.format(retry_handler.retry_num, retry_handler.max_retries, req, e))
 
-                    await asyncio.sleep(next_wait)
+        return parsed_response
 
-                    if isinstance(err, errors.SlowDown) or isinstance(err, errors.InternalError):
-                        next_wait *= 5  # 0.1->0.5->2.5->12.5->62.5
-
-                    continue
-                else:
-                    break
-
-        if response.status not in [200, 204]:
-            raise errors.AWSException.from_bytes(response.status, data, url)
-
-        return response, data
-
-    async def upload_multipart(self, key,
-            content_type='application/octed-stream',
-            MultipartUpload=MultipartUpload,
-            metadata={}):
+    async def upload_multipart(self, Key, content_type='application/octed-stream',
+                               MultipartUpload=MultipartUpload, metadata=None):
         """Upload file to S3 by uploading multiple chunks"""
 
-        if isinstance(key, Key):
-            key = key.key
-
         headers = {'CONTENT-TYPE': content_type}
+        if metadata is None: metadata = dict()
         for n, v in metadata.items():
             headers["x-amz-meta-" + n] = v
 
-        response, xml = await self._request("POST", '/' + key, params={'uploads': ''}, headers=headers)
+        response = await self._request("POST", '/' + Key, 'CreateMultipartUpload', params={'uploads': ''}, headers=headers)
 
-        xml = xmltodict.parse(xml)['InitiateMultipartUploadResult']
-        upload_id = xml['UploadId']
+        upload_id = response['UploadId']
 
         assert upload_id
-        return MultipartUpload(self, key, upload_id)
+        return MultipartUpload(self, Key, upload_id)
 
-    async def abort_multipart_upload(self, key, upload_id):
-        if isinstance(key, Key):
-            key = key.key
+    async def abort_multipart_upload(self, Key, upload_id):
+        return await self._request("DELETE", '/' + Key, 'AbortMultipartUpload', {"uploadId": upload_id})
 
-        await self._request("DELETE", '/' + key, {"uploadId": upload_id})
-
-    def list_multipart_uploads_by_chunks(self, prefix='', max_uploads=1000):
+    def list_multipart_uploads_by_chunks(self, Prefix='', max_uploads=1000):
         class _Pager:
-            def __init__(self, parent: Bucket, prefix, max_uploads):
+            def __init__(self, parent: Bucket):
                 self._parent = parent
                 self._final = False
                 self._key_marker = ''
                 self._upload_id_marker = ''
-                self._prefix = prefix
-                self._max_uploads = max_uploads
 
             async def next_page(self):
-                query = {'max-uploads': str(self._max_uploads), 'uploads': ''}
-                if len(self._prefix):
-                    query['prefix'] = self._prefix
+                params = {'max-uploads': str(max_uploads), 'uploads': ''}
+                if len(Prefix):
+                    params['prefix'] = Prefix
 
                 if len(self._key_marker):
-                    query['key-marker'] = self._key_marker
-                    query['upload-id-market'] = self._upload_id_marker
+                    params['key-marker'] = self._key_marker
+                    params['upload-id-marker'] = self._upload_id_marker
 
-                response, data = await self._parent._request("GET", "/", query)
+                response = await self._parent._request("GET", "/", 'ListMultipartUploads', params)
 
-                x = xmltodict.parse(data)['ListMultipartUploadsResult']
-                if 'Upload' not in x: x['Upload'] = []
+                if 'Uploads' not in response: response['Uploads'] = []
 
-                if x['IsTruncated'] == 'false' or len(x['Upload']) == 0:
+                if not response['IsTruncated'] or len(response['Uploads']) == 0:
                     self._final = True
                 else:
-                    self._key_marker = x['NextKeyMarker']
-                    self._upload_id_marker = x['NextUploadIdMarker']
+                    self._key_marker = response['NextKeyMarker']
+                    self._upload_id_marker = response['NextUploadIdMarker']
 
-                return x
+                return response
 
             async def __anext__(self):
                 if self._final: raise StopAsyncIteration
@@ -640,4 +603,4 @@ class Bucket:
             async def __aiter__(self):
                 return self
 
-        return _Pager(self, prefix, max_uploads)
+        return _Pager(self)
