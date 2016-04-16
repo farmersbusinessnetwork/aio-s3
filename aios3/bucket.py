@@ -81,7 +81,7 @@ def get_maximum_timeout(timeout: float or int, max_attempts: int) -> float:
     :param max_attempts: maximum number of attempts
     :return: maximimum combined timeout in seconds
     """
-    rh = _RetryHandler(timeout, max_attempts)
+    rh = _RetryHandler(max_attempts, timeout)
     return rh.max_timeout()
 
 
