@@ -6,7 +6,7 @@ except ImportError:
     from distutils.core import setup
 
 setup(name='aio-s3',
-      version='0.6.1',
+      version='0.6.2',
       description='Asyncio-based client for S3',
       author='Paul Colomiets',
       author_email='paul@colomiets.name',

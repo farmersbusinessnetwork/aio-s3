@@ -380,12 +380,15 @@ class Bucket:
             async def next_page(self):
                 if self.final: return None
 
-                result = await self.bucket.list(Prefix, Delimiter, allow_truncated=True, marker=self.marker, max_keys=MaxKeys)
+                result = await self.bucket.list(Prefix, Delimiter, allow_truncated=True, Marker=self.marker, MaxKeys=MaxKeys)
 
                 if not result['IsTruncated']:
                     self.final = True
                 else:
-                    self.marker = result.get('NextMarker', result['Contents'][-1]['Key'])
+                    if 'NextMarker' in result:
+                        self.marker = result['NextMarker']
+                    else:
+                        self.marker = result['Contents'][-1]['Key']
 
                 return result
 
