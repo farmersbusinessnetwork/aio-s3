@@ -15,6 +15,7 @@ import botocore.exceptions
 import botocore.session
 import botocore.client
 import botocore.credentials
+from botocore.handlers import parse_get_bucket_location
 
 import aiobotocore  # we use this to parse the response, it needs to be aiobotocore due to the aiohttp response object
 import aiobotocore.client
@@ -134,13 +135,19 @@ class MultipartUpload(object):
                 src_path += "?versionId={0}".format(obj_chunk.versionId)
             headers['x-amz-copy-source'] = src_path
             headers['x-amz-copy-source-range'] = "bytes={0}-{1}".format(obj_chunk.firstByte, obj_chunk.lastByte)
+            op_name = 'UploadPartCopy'
+        else:
+            op_name = 'UploadPart'
 
-        response = await self.bucket._request("PUT", '/' + self.key, 'UploadPart', {
+        response = await self.bucket._request("PUT", '/' + self.key, op_name, {
                 'uploadId': self.upload_id,
                 'partNumber': str(part_num),
             }, headers=headers, payload=data)
 
-        self.parts[part_num] = response['ETag']
+        if op_name == "UploadPartCopy":
+            self.parts[part_num] = response['CopyPartResult']['ETag']
+        else:
+            self.parts[part_num] = response['ETag']
 
     async def commit(self):
         if self._done:
@@ -308,6 +315,8 @@ class Bucket:
 
         response_dict = await convert_to_response_dict(http_response, operation_model)
         parsed_response = parser.parse(response_dict, operation_model.output_shape)
+        if operation_name == "GetBucketLocation":
+            parse_get_bucket_location(parsed_response, http_response)
 
         if http_response.status >= 300:
             raise botocore.exceptions.ClientError(parsed_response, operation_name)
