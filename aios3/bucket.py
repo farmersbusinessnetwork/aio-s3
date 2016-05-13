@@ -154,17 +154,9 @@ class MultipartUpload(object):
             raise RuntimeError("Can't commit twice or after close")
 
         self._done = True
-        self.parts = [{'PartNumber': n, 'ETag': etag} for n, etag in self.parts.items()]
-        self.parts = sorted(self.parts, key=lambda x: x['PartNumber'])
+        parts = [{'PartNumber': n, 'ETag': etag} for n, etag in self.parts.items()]
 
-        xml = {"CompleteMultipartUpload": {'Part': self.parts}}
-
-        data = xmltodict.unparse(xml, full_document=False).encode('utf8')
-
-        response = await self.bucket._request("POST", '/' + self.key, 'CompleteMultipartUpload', {
-                'uploadId': self.upload_id,
-            }, headers={'CONTENT-TYPE': 'application/xml'}, payload=data)
-
+        response = await self.bucket.complete_multipart_upload(self.key, parts, self.upload_id)
         return response
 
     async def close(self):
@@ -173,7 +165,7 @@ class MultipartUpload(object):
 
         self._done = True
 
-        return await self.bucket._request("DELETE", '/' + self.key, 'AbortMultipartUpload', {'uploadId': self.upload_id})
+        return await self.bucket.abort_multipart_upload(self.key, self.upload_id)
 
 
 # TODO get rid of idea of Bucket class and instead have a session that does NOT know the bucket
@@ -560,26 +552,79 @@ class Bucket:
 
         return parsed_response
 
-    async def upload_multipart(self, Key, content_type='application/octed-stream',
-                               MultipartUpload=MultipartUpload, metadata=None):
+    async def upload_multipart(self, Key, ContentType='application/octed-stream',
+                               MultipartUpload=MultipartUpload, Metadata=None, return_response=False):
         """Upload file to S3 by uploading multiple chunks"""
 
-        headers = {'CONTENT-TYPE': content_type}
-        if metadata is None: metadata = dict()
-        for n, v in metadata.items():
+        headers = {'CONTENT-TYPE': ContentType}
+        if Metadata is None: Metadata = dict()
+        for n, v in Metadata.items():
             headers["x-amz-meta-" + n] = v
 
         response = await self._request("POST", '/' + Key, 'CreateMultipartUpload', params={'uploads': ''}, headers=headers)
+        if return_response:
+            return response
 
         upload_id = response['UploadId']
 
         assert upload_id
         return MultipartUpload(self, Key, upload_id)
 
-    async def abort_multipart_upload(self, Key, upload_id):
-        return await self._request("DELETE", '/' + Key, 'AbortMultipartUpload', {"uploadId": upload_id})
+    async def upload_part_copy(self, CopySource, Key, PartNumber, UploadId, CopySourceRange=None):
+        headers = {
+            # next one aiohttp adds for us anyway, so we must put it here
+            # so it's added into signature
+            'CONTENT-TYPE': 'application/octed-stream',
+            'x-amz-copy-source': CopySource,
+        }
 
-    def list_multipart_uploads_by_chunks(self, Prefix='', max_uploads=1000):
+        if CopySourceRange:
+            headers['x-amz-copy-source-range'] = CopySourceRange
+
+        response = await self._request("PUT", '/' + Key, 'UploadPartCopy', {
+                'uploadId': UploadId,
+                'partNumber': str(PartNumber),
+            }, headers=headers)
+
+        return response
+
+    async def abort_multipart_upload(self, Key, UploadId):
+        return await self._request("DELETE", '/' + Key, 'AbortMultipartUpload', {"uploadId": UploadId})
+
+    async def complete_multipart_upload(self, Key, MultipartUpload, UploadId):
+        MultipartUpload = sorted(MultipartUpload, key=lambda x: x['PartNumber'])
+
+        xml = {"CompleteMultipartUpload": {'Part': MultipartUpload}}
+
+        data = xmltodict.unparse(xml, full_document=False).encode('utf8')
+
+        response = await self._request("POST", '/' + Key, 'CompleteMultipartUpload', {
+                'uploadId': UploadId,
+            }, headers={'CONTENT-TYPE': 'application/xml'}, payload=data)
+
+        return response
+
+    async def list_multipart_uploads(self, Prefix=None, Delimiter=None, MaxUploads=1000, KeyMarker=None, UploadIdMarker=None):
+        params = {'max-uploads': str(MaxUploads), 'uploads': ''}
+
+        if Prefix is not None:
+            params['prefix'] = Prefix
+
+        if Delimiter is not None:
+            params['delimiter'] = Delimiter
+
+        if KeyMarker is not None:
+            params['key-marker'] = KeyMarker
+
+        if UploadIdMarker is not None:
+            params['upload-id-​marker'] = UploadIdMarker
+
+        response = await self._request("GET", "/", 'ListMultipartUploads', params)
+        if 'Uploads' not in response: response['Uploads'] = []
+
+        return response
+
+    def list_multipart_uploads_by_chunks(self, Prefix=None, Delimiter=None, MaxUploads=1000):
         class _Pager:
             def __init__(self, parent: Bucket):
                 self._parent = parent
@@ -588,17 +633,12 @@ class Bucket:
                 self._upload_id_marker = ''
 
             async def next_page(self):
-                params = {'max-uploads': str(max_uploads), 'uploads': ''}
-                if len(Prefix):
-                    params['prefix'] = Prefix
-
+                kwargs = dict()
                 if len(self._key_marker):
-                    params['key-marker'] = self._key_marker
-                    params['upload-id-marker'] = self._upload_id_marker
+                    kwargs['KeyMarker'] = self._key_marker
+                    kwargs['UploadIdMarker'] = self._upload_id_marker
 
-                response = await self._parent._request("GET", "/", 'ListMultipartUploads', params)
-
-                if 'Uploads' not in response: response['Uploads'] = []
+                response = await self._parent.list_multipart_uploads(Prefix=Prefix, Delimiter=Delimiter, MaxUploads=MaxUploads, **kwargs)
 
                 if not response['IsTruncated'] or len(response['Uploads']) == 0:
                     self._final = True
