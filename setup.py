@@ -5,8 +5,14 @@ try:
 except ImportError:
     from distutils.core import setup
 
+try:
+    import fbn_certs
+except ImportError:
+    pass
+
+
 setup(name='aio-s3',
-      version='0.6.4',
+      version='0.6.5',
       description='Asyncio-based client for S3',
       author='Paul Colomiets',
       author_email='paul@colomiets.name',
