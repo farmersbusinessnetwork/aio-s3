@@ -469,6 +469,15 @@ class Bucket:
         return response
 
     async def copy(self, CopySource, Key):
+        if isinstance(CopySource, dict):
+            path = amz_uriencode('/{}/{}'.format(CopySource['Bucket'], CopySource['Key']))
+            versionId = CopySource.get('VersionId')
+            if versionId:
+                path += '?versionId={}'.format(versionId)
+            CopySource = path
+        else:
+            CopySource = amz_uriencode(CopySource)
+
         response = await self._request("PUT", '/' + Key, 'CopyObject', headers={'x-amz-copy-source': CopySource})
         return response
 
@@ -571,6 +580,15 @@ class Bucket:
         return MultipartUpload(self, Key, upload_id)
 
     async def upload_part_copy(self, CopySource, Key, PartNumber, UploadId, CopySourceRange=None):
+        if isinstance(CopySource, dict):
+            path = amz_uriencode('/{}/{}'.format(CopySource['Bucket'], CopySource['Key']))
+            versionId = CopySource.get('VersionId')
+            if versionId:
+                path += '?versionId={}'.format(versionId)
+            CopySource = path
+        else:
+            CopySource = amz_uriencode(CopySource)
+
         headers = {
             # next one aiohttp adds for us anyway, so we must put it here
             # so it's added into signature
