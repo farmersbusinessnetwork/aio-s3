@@ -475,7 +475,7 @@ class Bucket:
             if versionId:
                 path += '?versionId={}'.format(versionId)
             CopySource = path
-        else:
+        elif '?versionId=' not in CopySource:
             CopySource = amz_uriencode(CopySource)
 
         response = await self._request("PUT", '/' + Key, 'CopyObject', headers={'x-amz-copy-source': CopySource})
