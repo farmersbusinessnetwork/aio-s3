@@ -12,7 +12,7 @@ except ImportError:
 
 
 setup(name='aio-s3',
-      version='0.6.6',
+      version='0.6.7',
       description='Asyncio-based client for S3',
       author='Paul Colomiets',
       author_email='paul@colomiets.name',
