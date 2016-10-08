@@ -9,7 +9,6 @@ import aiohttp
 import hashlib
 import base64
 import functools
-
 import botocore.auth
 import botocore.exceptions
 import botocore.session
@@ -469,16 +468,26 @@ class Bucket:
         return response
 
     async def copy(self, CopySource, Key):
-        if isinstance(CopySource, dict):
-            path = amz_uriencode('/{}/{}'.format(CopySource['Bucket'], CopySource['Key']))
-            versionId = CopySource.get('VersionId')
-            if versionId:
-                path += '?versionId={}'.format(versionId)
-            CopySource = path
-        elif '?versionId=' not in CopySource:
-            CopySource = amz_uriencode(CopySource)
+        # transform to dictionary
+        if not isinstance(CopySource, dict):
+            src_bucket, src_key = CopySource.split('/', 1)
+            CopySource = {'Bucket': src_bucket, 'Key': src_key}
 
-        response = await self._request("PUT", '/' + Key, 'CopyObject', headers={'x-amz-copy-source': CopySource})
+            if '?versionId=' in src_key:
+                src_key, src_verid = src_key.split('?versionId=', 1)
+                CopySource['Key'] = src_key
+                CopySource['VersionId'] = src_verid
+
+        # transform to string
+        path = '{}/{}'.format(amz_uriencode(CopySource['Bucket']), amz_uriencode(CopySource['Key']))
+        versionId = CopySource.get('VersionId')
+        if versionId:
+            path += '?versionId={}'.format(versionId)
+
+        if path[0] != '/':
+            path = '/' + path
+
+        response = await self._request("PUT", '/' + Key, 'CopyObject', headers={'x-amz-copy-source': path})
         return response
 
     async def get(self, Key, IfMatch=None, Range=None, VersionId=None, num_retries=None):
