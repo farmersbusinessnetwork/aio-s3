@@ -17,7 +17,7 @@ import botocore.credentials
 from botocore.handlers import parse_get_bucket_location
 
 import aiobotocore  # we use this to parse the response, it needs to be aiobotocore due to the aiohttp response object
-import aiobotocore.client
+from aiobotocore.config import AioConfig
 from aiobotocore.endpoint import convert_to_response_dict
 
 # NOTE: if we ever enable this we'll need to support checking for signature expiration
@@ -272,7 +272,7 @@ class Bucket:
             'force_close': self._connector._force_close,
             'keepalive_timeout': self._connector._keepalive_timeout}
 
-        aio_config = aiobotocore.client.AioConfig(signature_version='s3v4', connector_args=connector_args)
+        aio_config = AioConfig(signature_version='s3v4', connector_args=connector_args)
 
         self._aio_boto_session = aiobotocore.get_session(loop=self._loop)
         self._aio_boto_client = self._aio_boto_session.create_client('s3', region_name=self._aws_region, config=aio_config, use_ssl=use_ssl)
